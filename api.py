@@ -169,8 +169,8 @@ async def post_pair(request):
     chat_id = pc["chat_id"]
     consume_pairing_code(code, router_id)
 
-    # Регистрируем роутер
-    upsert_router(router_id, chat_id, name=name, mac=mac, model=model)
+    # Регистрируем роутер (обновляем router_id на случай если MAC уже существует)
+    router_id = upsert_router(router_id, chat_id, name=name, mac=mac, model=model)
 
     # Генерируем уникальный секрет для этого роутера
     router_secret = secrets.token_hex(16)

@@ -99,6 +99,17 @@ async def cmd_add_router(message: Message):
         f"```\n"
     )
     await message.reply(text)
+    
+    # Отправляем уведомление пользователю лично
+    try:
+        await message.bot.send_message(
+            message.from_user.id,
+            f"🆕 Роутер добавляется!\nКод подключения: `{code}`\n\n"
+            f"Используйте команду /routers для проверки регистрации.",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить уведомление пользователю: {e}")
 
 
 # --- /routers ---
@@ -110,9 +121,65 @@ async def cmd_routers(message: Message):
         await message.reply("📭 У вас ещё нет роутеров. Добавьте: /add_router")
         return
     lines = ["🖥️ *Мои роутеры:*"]
+    builder = InlineKeyboardBuilder()
     for r in routers:
-        lines.append(f"• {r['name'] or r['router_id']} — {fmt_online(r['online'])} (MAC: {r['mac'] or 'н/д'})")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+        online = fmt_online(r['online'])
+        lines.append(f"• {r['name'] or r['router_id']} — {online} (MAC: {r['mac'] or 'н/д'})")
+        builder.button(text=f"🗑 {r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
+    await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+# --- Удаление роутера с подтверждением ---
+@dp.callback_query(F.data.startswith("del_router_"))
+async def callback_del_router(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админов")
+        return
+    
+    router_id = callback.data.replace("del_router_", "")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, удалить", callback_data=f"confirm_del_{router_id}")
+    builder.button(text="❌ Отмена", callback_data="cancel_del")
+    await callback.message.edit_text(
+        f"⚠️ Удалить роутер `{router_id}`?\nВсе данные (устройства, события, health-check) будут удалены.",
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("confirm_del_"))
+async def callback_confirm_delete(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админов")
+        return
+    
+    router_id = callback.data.replace("confirm_del_", "")
+    
+    # Удалить роутер и все связанные данные
+    from db import delete_router_complete
+    delete_router_complete(router_id)
+    
+    # Показать команду для ручного удаления агента
+    rm_cmd = (
+        f"📋 *Роутер `{router_id}` удалён из базы.*\n\n"
+        f"Для полного удаления агента с роутера выполните на нём:\n"
+        f"```\n"
+        f"rm -f /etc/netwatch/config\n"
+        f"rm -f /tmp/agent3.sh\n"
+        f"rm -f /mnt/usb/log/netwatch/netwatch-agent.log\n"
+        f"rm -f /var/run/netwatch-wifi-monitor.pid\n"
+        f"```\n"
+        f"ИЛИ просто переподключите роутер:"
+    )
+    await callback.message.edit_text(rm_cmd, parse_mode="Markdown")
+    await callback.answer("✅ Роутер удалён")
+
+
+@dp.callback_query(F.data == "cancel_del")
+async def callback_cancel_delete(callback: CallbackQuery):
+    await callback.message.edit_text("❌ Удаление отменено")
+    await callback.answer()
 
 
 # --- /devices ---

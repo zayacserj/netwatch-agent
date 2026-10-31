@@ -345,6 +345,16 @@ def delete_router_complete(router_id):
     conn.execute("DELETE FROM events WHERE router_id=?", (router_id,))
     conn.execute("DELETE FROM devices WHERE router_id=?", (router_id,))
     conn.execute("DELETE FROM router_secrets WHERE router_id=?", (router_id,))
-    conn.execute("DELETE FROM routers WHERE router_id=?", (router_id,))
     conn.commit()
     conn.close()
+
+
+def is_valid_router_secret(secret):
+    """Check if a secret is valid (exists in router_secrets table)"""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT router_id FROM router_secrets WHERE secret=?", 
+        (secret,)
+    ).fetchone()
+    conn.close()
+    return row is not None

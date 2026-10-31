@@ -32,7 +32,7 @@ async def auth_middleware(request, handler):
         return await handler(request)
     
     secret = request.headers.get("X-Agent-Secret")
-    if not secret or secret != AGENT_SECRET:
+    if not secret or not is_valid_router_secret(secret):
         return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
     return await handler(request)
 
@@ -160,7 +160,10 @@ async def post_pair(request):
     if not code or not router_id:
         return web.json_response({"error": "Missing fields: code, router_id"}, status=400)
 
-    from db import get_pairing_code, consume_pairing_code, upsert_router, get_conn
+    from db import (
+    get_pairing_code, consume_pairing_code, upsert_router, get_conn,
+    is_valid_router_secret
+)
 
     pc = get_pairing_code(code)
     if not pc:

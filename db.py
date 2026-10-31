@@ -112,6 +112,10 @@ def upsert_user(chat_id, username, first_name):
 
 
 def is_admin(chat_id):
+    import os as _os
+    admin_ids = [int(x) for x in _os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+    if chat_id in admin_ids:
+        return True
     conn = get_conn()
     row = conn.execute("SELECT is_admin FROM users WHERE chat_id=?", (chat_id,)).fetchone()
     conn.close()

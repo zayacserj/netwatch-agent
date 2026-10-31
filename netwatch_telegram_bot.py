@@ -99,17 +99,6 @@ async def cmd_add_router(message: Message):
         f"```\n"
     )
     await message.reply(text)
-    
-    # Отправляем уведомление пользователю лично
-    try:
-        await message.bot.send_message(
-            message.from_user.id,
-            f"🆕 Роутер добавляется!\nКод подключения: `{code}`\n\n"
-            f"Используйте команду /routers для проверки регистрации.",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logging.error(f"Не удалось отправить уведомление пользователю: {e}")
 
 
 # --- /routers ---

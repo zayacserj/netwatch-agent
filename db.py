@@ -157,6 +157,28 @@ def clean_user_data(chat_id):
 
 def upsert_router(router_id, chat_id, name=None, mac=None, model=None):
     conn = get_conn()
+    
+    # Если есть MAC — проверить, есть ли уже роутер с таким MAC
+    if mac:
+        existing = conn.execute(
+            "SELECT router_id FROM routers WHERE mac=? AND chat_id=?", 
+            (mac.lower(), chat_id)
+        ).fetchone()
+        if existing:
+            router_id = existing["router_id"]
+            # Обновить имя/модель
+            conn.execute("""
+                UPDATE routers SET 
+                    name=COALESCE(?, name),
+                    model=COALESCE(?, model),
+                    last_seen=unixepoch()
+                WHERE router_id=?
+            """, (name, model, router_id))
+            conn.commit()
+            conn.close()
+            return router_id
+    
+    # Иначе создать новый
     conn.execute("""
         INSERT INTO routers (router_id, chat_id, name, mac, model, online, last_seen)
         VALUES (?, ?, ?, ?, ?, 0, unixepoch())
@@ -167,6 +189,7 @@ def upsert_router(router_id, chat_id, name=None, mac=None, model=None):
     """, (router_id, chat_id, name, mac, model))
     conn.commit()
     conn.close()
+    return router_id
 
 
 def get_user_routers(chat_id):

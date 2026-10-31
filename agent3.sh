@@ -76,6 +76,12 @@ EOF
     echo "Router ID: $router_id"
     echo "Agent Secret: $agent_secret"
     echo "Конфиг сохранен в $CONFIG_FILE"
+
+    # Авто-запуск агента после pair
+    log "Авто-запуск агента..."
+    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/5 * * * * /tmp/agent3.sh run") | crontab -
+    /etc/init.d/netwatch-wifi-monitor start 2>/dev/null || true
+    log "Агент установлен и запущен (health-check каждые 5 мин, wifi-monitor)"
 }
 
 # --- run ---
@@ -162,6 +168,26 @@ cmd_wifi_monitor() {
     wait
 }
 
+# --- uninstall ---
+cmd_uninstall() {
+    log "Удаление NetWatch Agent..."
+    
+    # Остановка сервисов
+    /etc/init.d/netwatch-wifi-monitor stop 2>/dev/null || true
+    kill $(cat /var/run/netwatch-wifi-monitor.pid 2>/dev/null) 2>/dev/null || true
+    rm -f /var/run/netwatch-wifi-monitor.pid
+    
+    # Удаление cron
+    crontab -l 2>/dev/null | grep -v agent3.sh | crontab -
+    
+    # Удаление конфига и логов
+    rm -f /etc/netwatch/config
+    rm -f /mnt/usb/log/netwatch/netwatch-agent.log
+    rm -rf /etc/netwatch
+    
+    echo "Агент полностью удалён с роутера"
+}
+
 # --- get_router_id из файла ---
 get_router_id() {
     if [ -f /etc/netwatch/router_id ]; then
@@ -186,13 +212,17 @@ case "$1" in
     health-check)
         cmd_run
         ;;
+    uninstall)
+        cmd_uninstall
+        ;;
     *)
         echo "NetWatch Agent v3 (OpenWrt)"
-        echo "Использование: $0 {pair|run|wifi-monitor|health-check}"
+        echo "Использование: $0 {pair|run|wifi-monitor|health-check|uninstall}"
         echo ""
-        echo "  pair          -- Регистрация роутера на Pi"
+        echo "  pair          -- Регистрация роутера на Pi + авто-установка агента"
         echo "  run           -- Health-check + heartbeat (cron)"
         echo "  wifi-monitor  -- Мониторинг Wi-Fi в реальном времени (hostapd_cli)"
         echo "  health-check  -- Проверка здоровья роутера (интернет, Wi-Fi, CPU, RAM, клиенты, Podkop)"
+        echo "  uninstall     -- Полное удаление агента с роутера"
         ;;
 esac

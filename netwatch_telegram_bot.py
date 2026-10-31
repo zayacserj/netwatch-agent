@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from db import (
     init_db, upsert_user, is_admin, set_admin, get_all_users, delete_user, clean_user_data,
     upsert_router, get_user_routers, get_all_routers, set_router_online,
-    get_user_devices, set_device_online,
+    get_user_devices, get_user_devices_count, set_device_online,
     add_event, get_user_events,
     get_latest_health, get_user_health, add_health_check,
     create_pairing_code, get_pairing_code, consume_pairing_code,
@@ -124,7 +124,8 @@ async def cmd_routers(message: Message):
     builder = InlineKeyboardBuilder()
     for r in routers:
         online = fmt_online(r['online'])
-        lines.append(f"• {r['name'] or r['router_id']} — {online} (MAC: {r['mac'] or 'н/д'})")
+        dev_count = get_user_devices_count(message.from_user.id, r['router_id'])
+        lines.append(f"• {r['name'] or r['router_id']} — {online} (устройств: {dev_count}, MAC: {r['mac'] or 'н/д'})")
         builder.button(text=f"🗑 {r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
     await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
 

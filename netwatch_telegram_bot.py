@@ -26,6 +26,7 @@ from db import (
     add_event, get_user_events,
     get_latest_health, get_user_health, add_health_check,
     create_pairing_code, get_pairing_code, consume_pairing_code,
+    delete_router_complete,
 )
 
 logging.basicConfig(
@@ -122,11 +123,14 @@ async def cmd_routers(message: Message):
 # --- Удаление роутера с подтверждением ---
 @dp.callback_query(F.data.startswith("del_router_"))
 async def callback_del_router(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админов")
+    router_id = callback.data.replace("del_router_", "")
+    
+    # Проверка: роутер должен принадлежать этому пользователю
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ У вас нет прав на удаление этого роутера")
         return
     
-    router_id = callback.data.replace("del_router_", "")
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Да, удалить", callback_data=f"confirm_del_{router_id}")
     builder.button(text="❌ Отмена", callback_data="cancel_del")
@@ -140,14 +144,15 @@ async def callback_del_router(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirm_del_"))
 async def callback_confirm_delete(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админов")
-        return
-    
     router_id = callback.data.replace("confirm_del_", "")
     
+    # Проверка: роутер должен принадлежать этому пользователю
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ У вас нет прав на удаление этого роутера")
+        return
+    
     # Удалить роутер и все связанные данные
-    from db import delete_router_complete
     delete_router_complete(router_id)
     
     # Показать команду для ручного удаления агента

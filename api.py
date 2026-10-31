@@ -15,6 +15,11 @@ from pathlib import Path
 
 from aiohttp import web
 
+from db import (
+    get_pairing_code, consume_pairing_code, upsert_router, get_conn,
+    is_valid_router_secret
+)
+
 DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
@@ -159,11 +164,6 @@ async def post_pair(request):
 
     if not code or not router_id:
         return web.json_response({"error": "Missing fields: code, router_id"}, status=400)
-
-    from db import (
-    get_pairing_code, consume_pairing_code, upsert_router, get_conn,
-    is_valid_router_secret
-)
 
     pc = get_pairing_code(code)
     if not pc:

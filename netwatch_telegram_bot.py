@@ -82,15 +82,20 @@ async def cmd_add_router(message: Message):
     create_pairing_code(code, message.from_user.id, expires_sec=900)
 
     github_agent_url = "https://raw.githubusercontent.com/zayacserj/netwatch-agent/main/agent3.sh"
-    pi_url = os.getenv("PI_URL", "http://95.31.29.233")
+    pi_url = os.getenv("PI_URL", "http://192.168.10.222:8080")
+    pi_url_public = os.getenv("PI_URL_PUBLIC", "http://95.31.29.233:8080")
     
     text = (
         f"🔐 Код подключения роутера:\n\n"
         f"`{code}`\n\n"
         f"Действует 15 минут.\n\n"
-        f"🚀 Быстрая установка (одна команда — нажми, чтобы скопировать):\n"
+        f"🚀 Быстрая установка (локальная сеть):\n"
         f"```\n"
         f"curl -sS {github_agent_url} -o /tmp/agent3.sh && chmod +x /tmp/agent3.sh && /tmp/agent3.sh pair --code {code} --url {pi_url}\n"
+        f"```\n\n"
+        f"🌐 Для роутеров в другой сети (интернет):\n"
+        f"```\n"
+        f"curl -sS {github_agent_url} -o /tmp/agent3.sh && chmod +x /tmp/agent3.sh && /tmp/agent3.sh pair --code {code} --url {pi_url_public}\n"
         f"```\n"
     )
     await message.reply(text)

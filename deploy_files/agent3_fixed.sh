@@ -150,44 +150,43 @@ cmd_run() {
     local ram_escaped=$(json_escape "$ram")
     local podkop_status_escaped=$(json_escape "$podkop_status")
 
-    # Сбор устройств для /devices endpoint (DHCP leases + ARP-table, fallback on iw)
+    # Сбор устройств для /devices endpoint (DHCP leases + ARP-table + Associated Stations iw)
     local devices_json="[]"
+    local all_devices=""
+
+    # 1. DHCP leases: MAC, IP, hostname
     if [ -f /tmp/dhcp.leases ]; then
-        # DHCP leases: MAC, IP, hostname
         local leases=$(cat /tmp/dhcp.leases 2>/dev/null | awk '{print $2, $3, $4}' | while read mac ip hostname; do
             [ -n "$mac" ] && [ -n "$ip" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"$hostname\"}"
         done | tr '\n' ',' | sed 's/,$//')
-        [ -n "$leases" ] && devices_json="[$leases]"
+        [ -n "$leases" ] && all_devices="${all_devices}${leases},"
     fi
 
-    # Fallback: ARP-таблица, если DHCP leases пусты
-    if [ "$devices_json" = "[]" ]; then
-        local arp_list=$(arp -a 2>/dev/null | awk '{print $2, $3}' | sed 's/[()]//g' | while read ip mac; do
-            [ -n "$ip" ] && [ -n "$mac" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"}"
-        done | tr '\n' ',' | sed 's/,$//')
-        [ -n "$arp_list" ] && devices_json="[$arp_list]"
-    fi
-    
-    # Fallback: iw (Wi-Fi clients only)
-    if [ "$devices_json" = "[]" ] && command -v iw > /dev/null 2>&1; then
+    # 2. ARP-таблица
+    local arp_list=$(arp -a 2>/dev/null | awk '{print $2, $3}' | sed 's/[()]//g' | while read ip mac; do
+        [ -n "$ip" ] && [ -n "$mac" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"}"
+    done | tr '\n' ',' | sed 's/,$//')
+    [ -n "$arp_list" ] && all_devices="${all_devices}${arp_list},"
+
+    # 3. Associated Stations (Wi-Fi clients) - всегда проверяем
+    if command -v iw > /dev/null 2>&1; then
         local mac_list=$(iw dev wlan0 station dump 2>/dev/null | grep "Station" | awk '{print $2}')
         mac_list="$mac_list $(iw dev wlan1 station dump 2>/dev/null | grep "Station" | awk '{print $2}')"
         
         if [ -n "$mac_list" ]; then
-            local dev_json=""
             for mac in $mac_list; do
                 mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
                 local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
                 [ -z "$ip" ] && ip="unknown"
-                # Используем printf для безопасного создания JSON объекта
                 local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "unknown")
-                dev_json="${dev_json}${dev_obj},"
+                all_devices="${all_devices}${dev_obj},"
             done
-            # Убираем последнюю запятую и оборачиваем в массив
-            dev_json=$(echo "$dev_json" | sed 's/,$//')
-            devices_json="[$dev_json]"
         fi
     fi
+
+    # Убираем последнюю запятую и формируем JSON
+    all_devices=$(echo "$all_devices" | sed 's/,$//')
+    [ -n "$all_devices" ] && devices_json="[$all_devices]"
 
     # Отправка устройств на /devices
     curl -sS -4 -X POST "$PI_URL/devices" \

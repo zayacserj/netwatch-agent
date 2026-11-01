@@ -183,21 +183,33 @@ async def callback_cancel_delete(callback: CallbackQuery):
 @dp.message(Command("devices"))
 async def cmd_devices(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    devices = get_user_devices(message.from_user.id)
-    if not devices:
-        await message.reply("📭 Нет Wi-Fi устройств. Подключите роутер: /add_router")
+    routers = get_user_routers(message.from_user.id)
+    if not routers:
+        await message.reply("📭 У вас нет роутеров. Добавьте: /add_router")
         return
     builder = InlineKeyboardBuilder()
     lines = ["📱 *Мои Wi-Fi устройства:*"]
-    for d in devices:
-        status = "🟢" if d["online"] else "🔴"
-        name = d["custom_name"] or d["hostname"] or "неизвестно"
-        router_name = d.get("router_name", "н/д")
-        lines.append(f"{status} `{d['mac']}` — {name} ({router_name})")
-        builder.button(
-            text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
-            callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
-        )
+    seen_macs = set()
+    for r in routers:
+        router_name = r["name"] or r["router_id"]
+        devs = get_user_devices(message.from_user.id, r["router_id"])
+        if not devs:
+            continue
+        lines.append(f"\n🔹 *{router_name}:*")
+        for d in devs:
+            mac_key = d["mac"].lower()
+            if mac_key in seen_macs:
+                continue
+            seen_macs.add(mac_key)
+            status = "🟢" if d["online"] else "🔴"
+            name = d["custom_name"] or d["hostname"] or "неизвестно"
+            lines.append(f"{status} `{d['mac']}` — {name}")
+            builder.button(
+                text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
+                callback_data=f"device_detail|{d['mac']}|{r['router_id']}"
+            )
+    if not lines[-1].startswith("🔹"):
+        lines.append("Нет устройств.")
     builder.adjust(1)
     await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
 

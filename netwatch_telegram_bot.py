@@ -118,7 +118,7 @@ async def cmd_routers(message: Message):
         dev_count = get_user_devices_count(message.from_user.id, r['router_id'])
         lines.append(f"• {r['name'] or r['router_id']} — {online} (устройств: {dev_count}, MAC: {r['mac'] or 'н/д'})")
         builder.button(text=f"🗑 {r['name'] or r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
-    await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+    await message.reply("\n".join(lines),  reply_markup=builder.as_markup())
 
 
 # --- Удаление роутера с подтверждением ---
@@ -138,7 +138,7 @@ async def callback_del_router(callback: CallbackQuery):
     builder.button(text="❌ Отмена", callback_data="cancel_del")
     await callback.message.edit_text(
         f"⚠️ Удалить роутер `{router['name'] or router_id}` (`{router_id}`)?\nВсе данные (устройства, события, health-check) будут удалены.",
-        parse_mode="Markdown",
+        
         reply_markup=builder.as_markup()
     )
     await callback.answer()
@@ -169,7 +169,7 @@ async def callback_confirm_delete(callback: CallbackQuery):
         f"```\n"
         f"ИЛИ просто переподключите роутер:"
     )
-    await callback.message.edit_text(rm_cmd, parse_mode="Markdown")
+    await callback.message.edit_text(rm_cmd, reply_markup=builder.as_markup())
     await callback.answer("✅ Роутер удалён")
 
 
@@ -245,7 +245,7 @@ async def callback_device_detail(callback: CallbackQuery):
     builder.button(text="◀ Назад к списку", callback_data="device_back_list")
     builder.adjust(2, 1)
     
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+    await callback.message.edit_text(text,  reply_markup=builder.as_markup())
     await callback.answer()
 
 
@@ -288,7 +288,7 @@ async def callback_device_rename(callback: CallbackQuery):
     await callback.message.edit_text(
         f"✏️ Введите новое имя для устройства `{mac}`:\n\n"
         f"Отправьте сообщение с новым именем.",
-        parse_mode="Markdown"
+        
     )
     # Store state: user is waiting to rename this device
     callback.from_user._pending_rename = {"mac": mac, "router_id": router_id}
@@ -326,7 +326,7 @@ async def callback_device_notify(callback: CallbackQuery):
         builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify|{mac}|{router_id}")
         builder.button(text="◀ Назад к списку", callback_data="device_back_list")
         builder.adjust(2, 1)
-        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+        await callback.message.edit_text(text,  reply_markup=builder.as_markup())
 
 
 # --- Handle text input for rename ---
@@ -348,7 +348,7 @@ async def handle_pending_rename(message: Message):
     set_device_custom_name(mac, router_id, new_name)
     user._pending_rename = None
     
-    await message.reply(f"✅ Устройство `{mac}` переименовано в *{new_name}*", parse_mode="Markdown")
+    await message.reply(f"✅ Устройство `{mac}` переименовано в *{new_name}*", )
 
 
 # --- /settings ---
@@ -405,7 +405,7 @@ async def cmd_guide(message: Message):
         "5. История событий: /history\n"
         "6. Статус здоровья: /health\n"
     )
-    await message.reply(text, parse_mode="Markdown")
+    await message.reply(text, )
 
 
 # --- /history ---
@@ -421,7 +421,7 @@ async def cmd_history(message: Message):
         t = fmt_time(e["timestamp"])
         evt = "🟢 подключился" if "CONNECTED" in e["event"].upper() else "🔴 отключился"
         lines.append(f"{t} — {e.get('router_name', e['router_id'])}: {e['mac']} {evt}")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+    await message.reply("\n".join(lines), )
 
 
 # --- /health ---
@@ -447,7 +447,7 @@ async def cmd_health(message: Message):
             )
         else:
             lines.append(f"• {r['name'] or r['router_id']}: ⏳ нет данных о health-check")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+    await message.reply("\n".join(lines), )
 
 
 # --- /admin ---
@@ -479,7 +479,7 @@ async def admin_list_users(callback: CallbackQuery):
         lines.append(f"`{u['chat_id']}` {u['username'] or ''} {u['first_name'] or ''}{admin_tag}")
     lines.append("\nУдалить пользователя:\n`/admin_clean_user <chat_id> del`")
     lines.append("Очистить данные:\n`/admin_clean_user <chat_id> clean`")
-    await callback.message.edit_text("\n".join(lines), parse_mode="Markdown")
+    await callback.message.edit_text("\n".join(lines), )
     await callback.answer()
 
 

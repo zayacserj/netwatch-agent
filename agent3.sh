@@ -162,7 +162,9 @@ cmd_run() {
                 mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
                 local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
                 [ -z "$ip" ] && ip="unknown"
-                dev_json="${dev_json}{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"},"
+                # Используем printf для безопасного создания JSON объекта
+                local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "unknown")
+                dev_json="${dev_json}${dev_obj},"
             done
             # Убираем последнюю запятую и оборачиваем в массив
             dev_json=$(echo "$dev_json" | sed 's/,$//')

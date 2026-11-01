@@ -192,9 +192,10 @@ async def cmd_devices(message: Message):
     for d in devices:
         status = "🟢" if d["online"] else "🔴"
         name = d["custom_name"] or d["hostname"] or "неизвестно"
-        lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
+        router_name = d.get("router_name", "н/д")
+        lines.append(f"{status} `{d['mac']}` — {name} ({router_name})")
         builder.button(
-            text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
+            text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
             callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
         )
     builder.adjust(1)
@@ -250,9 +251,10 @@ async def callback_device_back(callback: CallbackQuery):
     for d in devices:
         status = "🟢" if d["online"] else "🔴"
         name = d["custom_name"] or d["hostname"] or "неизвестно"
-        lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
+        router_name = d.get("router_name", "н/д")
+        lines.append(f"{status} `{d['mac']}` — {name} ({router_name})")
         builder.button(
-            text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
+            text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
             callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
         )
     builder.adjust(1)

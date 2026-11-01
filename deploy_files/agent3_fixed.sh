@@ -76,11 +76,9 @@ ROUTER_ID="$router_id"
 AGENT_SECRET="$agent_secret"
 EOF
     chmod 600 "$CONFIG_FILE"
-
-    echo "Роутер успешно зарегистрирован!"
-    echo "Router ID: $router_id"
-    echo "Agent Secret: $agent_secret"
-    echo "Конфиг сохранен в $CONFIG_FILE"
+    # Copy this script to /etc/netwatch/ for cron
+    cp "$0" /etc/netwatch/agent3.sh
+    chmod +x /etc/netwatch/agent3.sh
 
     # Авто-запуск агента после pair
     log "Авто-запуск агента..."

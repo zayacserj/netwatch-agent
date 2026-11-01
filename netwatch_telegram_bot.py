@@ -194,6 +194,7 @@ async def cmd_devices(message: Message):
         router_name = r["name"] or r["router_id"]
         devs = get_user_devices(message.from_user.id, r["router_id"])
         if not devs:
+            lines.append(f"\n🔹 *{router_name}:* — устройств нет")
             continue
         lines.append(f"\n🔹 *{router_name}:*")
         for d in devs:
@@ -208,8 +209,6 @@ async def cmd_devices(message: Message):
                 text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
                 callback_data=f"device_detail|{d['mac']}|{r['router_id']}"
             )
-    if not lines[-1].startswith("🔹"):
-        lines.append("Нет устройств.")
     builder.adjust(1)
     await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
 

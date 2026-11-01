@@ -233,7 +233,7 @@ get_router_id() {
     if [ -f /etc/netwatch/router_id ]; then
         cat /etc/netwatch/router_id
     elif [ -f /etc/netwatch/config ] && grep -q '^ROUTER_ID=' /etc/netwatch/config; then
-        grep '^ROUTER_ID=' /etc/netwatch/config | cut -d'=' -f2-
+        grep '^ROUTER_ID=' /etc/netwatch/config | cut -d'=' -f2- | sed 's/^"//; s/"$//'
     fi
 }
 

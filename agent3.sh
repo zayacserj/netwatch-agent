@@ -25,6 +25,11 @@ log() {
     fi
 }
 
+# JSON escape function for shell strings
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\//\\\//g; s/\t/\\t/g; s/\n/\\n/g; s/\r/\\r/g'
+}
+
 # --- pair ---
 cmd_pair() {
     log "Начинаем pair..."
@@ -79,7 +84,7 @@ EOF
 
     # Авто-запуск агента после pair
     log "Авто-запуск агента..."
-    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/5 * * * * /tmp/agent3.sh run") | crontab -
+    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/5 * * * * /etc/netwatch/agent3.sh run") | crontab -
     /etc/init.d/netwatch-wifi-monitor start 2>/dev/null || true
     log "Агент установлен и запущен (health-check каждые 5 мин, wifi-monitor)"
 }
@@ -118,11 +123,11 @@ cmd_run() {
     fi
 
     # CPU
-    cpu=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
+    cpu=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
     [ -z "$cpu" ] && cpu="0"
 
     # RAM
-    ram=$(free -m | awk '/Mem:/ { printf "%dMB/%dMB", $3, $2 }')
+    ram=$(free -m 2>/dev/null | awk '/Mem:/ { printf "%dMB/%dMB", $3, $2 }')
     [ -z "$ram" ] && ram="0MB/0MB"
 
     # Состояние Podkop (если установлен)
@@ -139,11 +144,44 @@ cmd_run() {
         fi
     fi
 
-    # Отправка на Pi
+    # Экранируем строковые значения для JSON
+    local cpu_escaped=$(json_escape "$cpu")
+    local ram_escaped=$(json_escape "$ram")
+    local podkop_status_escaped=$(json_escape "$podkop_status")
+
+    # Сбор устройств для /devices endpoint
+    local devices_json="[]"
+    if command -v iw > /dev/null 2>&1; then
+        # Получаем MAC адреса клиентов с wlan0 и wlan1
+        local mac_list=$(iw dev wlan0 station dump 2>/dev/null | grep "Station" | awk '{print $2}')
+        mac_list="$mac_list $(iw dev wlan1 station dump 2>/dev/null | grep "Station" | awk '{print $2}')"
+        
+        if [ -n "$mac_list" ]; then
+            local dev_json=""
+            for mac in $mac_list; do
+                mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
+                local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
+                [ -z "$ip" ] && ip="unknown"
+                dev_json="${dev_json}{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"},"
+            done
+            # Убираем последнюю запятую и оборачиваем в массив
+            dev_json=$(echo "$dev_json" | sed 's/,$//')
+            devices_json="[$dev_json]"
+        fi
+    fi
+
+    # Отправка устройств на /devices
+    curl -sS -4 -X POST "$PI_URL/devices" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Secret: $AGENT_SECRET" \
+        -d "{\"router_id\":\"$router_id\",\"devices\":$devices_json,\"timestamp\":$timestamp}" >/dev/null 2>&1
+    echo ""
+
+    # Отправка health-check на /health
     curl -sS -4 -X POST "$PI_URL/health" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Secret: $AGENT_SECRET" \
-        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu\",\"ram\":\"$ram\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status\",\"podkop_test\":$podkop_test,\"timestamp\":$timestamp}"
+        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu_escaped\",\"ram\":\"$ram_escaped\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status_escaped\",\"podkop_test\":$podkop_test,\"timestamp\":$timestamp}"
     echo ""
 }
 
@@ -220,7 +258,7 @@ case "$1" in
         echo "Использование: $0 {pair|run|wifi-monitor|health-check|uninstall}"
         echo ""
         echo "  pair          -- Регистрация роутера на Pi + авто-установка агента"
-        echo "  run           -- Health-check + heartbeat (cron)"
+        echo "  run           -- Health-check + heartbeat (cron) + отправка устройств"
         echo "  wifi-monitor  -- Мониторинг Wi-Fi в реальном времени (hostapd_cli)"
         echo "  health-check  -- Проверка здоровья роутера (интернет, Wi-Fi, CPU, RAM, клиенты, Podkop)"
         echo "  uninstall     -- Полное удаление агента с роутера"

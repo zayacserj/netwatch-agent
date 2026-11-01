@@ -82,9 +82,12 @@ EOF
 
     # Авто-запуск агента после pair
     log "Авто-запуск агента..."
-    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/5 * * * * /etc/netwatch/agent3.sh run") | crontab -
+    # Первый запуск сразу
+    /etc/netwatch/agent3.sh run
+    # Крон каждые 2 минуты
+    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/2 * * * * /etc/netwatch/agent3.sh run") | crontab -
     /etc/init.d/netwatch-wifi-monitor start 2>/dev/null || true
-    log "Агент установлен и запущен (health-check каждые 5 мин, wifi-monitor)"
+    log "Агент установлен и запущен (health-check каждые 2 мин, wifi-monitor)"
 }
 
 # --- run ---

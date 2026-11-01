@@ -117,7 +117,7 @@ async def cmd_routers(message: Message):
         online = fmt_online(r['online'])
         dev_count = get_user_devices_count(message.from_user.id, r['router_id'])
         lines.append(f"• {r['name'] or r['router_id']} — {online} (устройств: {dev_count}, MAC: {r['mac'] or 'н/д'})")
-        builder.button(text=f"🗑 {r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
+        builder.button(text=f"🗑 {r['name'] or r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
     await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
 
 
@@ -128,7 +128,8 @@ async def callback_del_router(callback: CallbackQuery):
     
     # Проверка: роутер должен принадлежать этому пользователю
     user_routers = get_user_routers(callback.from_user.id)
-    if not any(r["router_id"] == router_id for r in user_routers):
+    router = next((r for r in user_routers if r["router_id"] == router_id), None)
+    if not router:
         await callback.answer("⛔ У вас нет прав на удаление этого роутера")
         return
     
@@ -136,7 +137,7 @@ async def callback_del_router(callback: CallbackQuery):
     builder.button(text="✅ Да, удалить", callback_data=f"confirm_del_{router_id}")
     builder.button(text="❌ Отмена", callback_data="cancel_del")
     await callback.message.edit_text(
-        f"⚠️ Удалить роутер `{router_id}`?\nВсе данные (устройства, события, health-check) будут удалены.",
+        f"⚠️ Удалить роутер `{router['name'] or router_id}` (`{router_id}`)?\nВсе данные (устройства, события, health-check) будут удалены.",
         parse_mode="Markdown",
         reply_markup=builder.as_markup()
     )

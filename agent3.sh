@@ -1,284 +1,519 @@
-#!/bin/sh
-# NetWatch Agent v3 (OpenWrt)
-# Только Wi-Fi подключения — проводные игнорируются
+"""
+NetWatch Telegram Bot (aiogram)
+Commands: /start, /add_router, /routers, /devices, /settings, /guide, /history, /health, /admin
+"""
+import os
+import asyncio
+import secrets
+import time
+import logging
+from datetime import datetime
+from pathlib import Path
 
-set -e
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-CONFIG_FILE="/etc/netwatch/config"
-LOG_FILE="/mnt/usb/log/netwatch/netwatch-agent.log"
+# Импорты из db.py (должен быть в той же папке)
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
 
-# Загрузка конфига
-if [ -f "$CONFIG_FILE" ]; then
-    . "$CONFIG_FILE"
-else
-    PI_URL="https://netwatchagent.duckdns.org"
-    ROUTER_ID=""
-    AGENT_SECRET=""
-fi
+from db import (
+    init_db, upsert_user, is_admin, set_admin, get_all_users, delete_user, clean_user_data,
+    upsert_router, get_user_routers, get_all_routers, set_router_online,
+    get_user_devices, get_user_devices_count, set_device_online,
+    get_device, set_device_custom_name, toggle_device_watch_online,
+    add_event, get_user_events,
+    get_latest_health, get_user_health, add_health_check,
+    create_pairing_code, get_pairing_code, consume_pairing_code,
+    delete_router_complete,
+)
 
-log() {
-    local ts=$(date '+%Y-%m-%d %H:%M:%S')
-    local msg="[$ts] $1"
-    echo "$msg"
-    if [ -d "$(dirname "$LOG_FILE")" ] 2>/dev/null; then
-        echo "$msg" >> "$LOG_FILE"
-    fi
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
-# JSON escape function for shell strings
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\//\\\//g; s/\t/\\t/g; s/\n/\\n/g; s/\r/\\r/g'
-}
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Set TELEGRAM_BOT_TOKEN env var")
 
-# --- pair ---
-cmd_pair() {
-    log "Начинаем pair..."
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-    # Parse flags: --code <code> --url <url>
-    local code=""
-    local url=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --code) code="$2"; shift 2 ;;
-            --url) url="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-    if [ -z "$code" ] || [ -z "$url" ]; then
-        echo "Использование: $0 pair --code <код> --url <url>"
-        exit 1
-    fi
 
-    local router_id="rt_$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "rt_$(date +%s)_$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo 0)")"
-    router_id="${router_id:0:13}"
-    local mac=$(cat /sys/class/net/wlan0/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || echo "unknown")
-    local model=$(cat /tmp/sysinfo/model 2>/dev/null || echo "OpenWrt Router")
+def fmt_time(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
-    local json_payload='{"code":"'"$code"'","router_id":"'"$router_id"'","mac":"'"$mac"'","name":"'"$model"'","model":"'"$model"'"}'
 
-    local response=$(curl -sS -4 -X POST "$url/pair" \
-        -H "Content-Type: application/json" \
-        -d "$json_payload")
+def fmt_online(online: int) -> str:
+    return "🟢 онлайн" if online else "🔴 оффлайн"
 
-    echo "Ответ Pi: $response"
 
-    local agent_secret=$(echo "$response" | grep -o '"agent_secret"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:[^"]*"\([^"]*\)"$/\1/')
-    if [ -z "$agent_secret" ]; then
-        echo "Ошибка: не удалось получить agent_secret"
-        exit 1
-    fi
+# --- /start ---
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    if message.from_user.id in ADMIN_IDS:
+        set_admin(message.from_user.id, True)
+    text = (
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        "Это бот NetWatch для мониторинга Wi-Fi сетей через OpenWrt-роутеры.\n\n"
+        "Команды:\n"
+        "• /add_router — добавить роутер\n"
+        "• /routers — мои роутеры\n"
+        "• /devices — подключённые Wi-Fi устройства\n"
+        "• /history — история событий (24ч)\n"
+        "• /health — статус здоровья роутеров\n"
+        "• /settings — настройки уведомлений\n"
+        "• /guide — инструкция\n"
+    )
+    if is_admin(message.from_user.id):
+        text += "\n🔐 /admin — админ-панель"
+    await message.reply(text)
 
-    mkdir -p /etc/netwatch
-    cat > "$CONFIG_FILE" << EOF
-PI_URL="$url"
-ROUTER_ID="$router_id"
-AGENT_SECRET="$agent_secret"
-EOF
-    chmod 600 "$CONFIG_FILE"
 
-    echo "Роутер успешно зарегистрирован!"
-    echo "Router ID: $router_id"
-    echo "Agent Secret: $agent_secret"
-    echo "Конфиг сохранен в $CONFIG_FILE"
+# --- /add_router ---
+@dp.message(Command("add_router"))
+async def cmd_add_router(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    code = secrets.token_hex(4)  # 8 hex chars = 4 bytes
+    create_pairing_code(code, message.from_user.id, expires_sec=900)
 
-    # Авто-запуск агента после pair
-    log "Авто-запуск агента..."
-    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/5 * * * * /etc/netwatch/agent3.sh run") | crontab -
-    /etc/init.d/netwatch-wifi-monitor start 2>/dev/null || true
-    log "Агент установлен и запущен (health-check каждые 5 мин, wifi-monitor)"
-}
-
-# --- run ---
-cmd_run() {
-    local router_id=$(get_router_id)
-    if [ -z "$router_id" ]; then
-        log "Роутер не зарегистрирован. Выполните pair."
-        exit 1
-    fi
-
-    local timestamp=$(date +%s)
-    local internet=1
-    local wifi_status=1
-    local cpu=""
-    local ram=""
-    local wifi_clients=0
-    local podkop_status="unknown"
-    local podkop_test=0
-
-    # Проверка интернета
-    if ping -c 1 -W 3 8.8.8.8 > /dev/null 2>&1; then
-        internet=1
-    else
-        internet=0
-    fi
-
-    # Проверка Wi-Fi (hostapd_cli)
-    if hostapd_cli status > /dev/null 2>&1; then
-        wifi_status=1
-        # Количество подключённых Wi-Fi клиентов
-        wifi_clients=$(hostapd_cli all_sta 2>/dev/null | grep -c "SSID=" || echo 0)
-    else
-        wifi_status=0
-    fi
-
-    # CPU
-    cpu=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-    [ -z "$cpu" ] && cpu="0"
-
-    # RAM
-    ram=$(free -m 2>/dev/null | awk '/Mem:/ { printf "%dMB/%dMB", $3, $2 }')
-    [ -z "$ram" ] && ram="0MB/0MB"
-
-    # Состояние Podkop (если установлен)
-    if command -v podkop > /dev/null 2>&1; then
-        if podkop status > /dev/null 2>&1; then
-            podkop_status="running"
-        else
-            podkop_status="stopped"
-        fi
-        if podkop test > /dev/null 2>&1; then
-            podkop_test=1
-        else
-            podkop_test=0
-        fi
-    fi
-
-    # Экранируем строковые значения для JSON
-    local cpu_escaped=$(json_escape "$cpu")
-    local ram_escaped=$(json_escape "$ram")
-    local podkop_status_escaped=$(json_escape "$podkop_status")
-
-    # Сбор устройств для /devices endpoint (DHCP leases + ARP-table, fallback on iw)
-    local devices_json="[]"
-    if [ -f /tmp/dhcp.leases ]; then
-        # DHCP leases: MAC, IP, hostname
-        local leases=$(cat /tmp/dhcp.leases 2>/dev/null | awk '{print $2, $3, $4}' | while read mac ip hostname; do
-            [ -n "$mac" ] && [ -n "$ip" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"$hostname\"}"
-        done | tr '\n' ',' | sed 's/,$//')
-        [ -n "$leases" ] && devices_json="[$leases]"
-    fi
-
-    # Fallback: ARP-таблица, если DHCP leases пусты
-    if [ "$devices_json" = "[]" ]; then
-        local arp_list=$(arp -a 2>/dev/null | awk '{print $2, $3}' | sed 's/[()]//g' | while read ip mac; do
-            [ -n "$ip" ] && [ -n "$mac" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"}"
-        done | tr '\n' ',' | sed 's/,$//')
-        [ -n "$arp_list" ] && devices_json="[$arp_list]"
-    fi
+    github_agent_url = "https://raw.githubusercontent.com/zayacserj/netwatch-agent/main/agent3.sh"
+    pi_url = os.getenv("PI_URL", "http://192.168.10.222:8080")
+    pi_url_public = os.getenv("PI_URL_PUBLIC", "http://95.31.29.233:8080")
     
-    # Fallback: iw (Wi-Fi clients only)
-    if [ "$devices_json" = "[]" ] && command -v iw > /dev/null 2>&1; then
-        local mac_list=$(iw dev wlan0 station dump 2>/dev/null | grep "Station" | awk '{print $2}')
-        mac_list="$mac_list $(iw dev wlan1 station dump 2>/dev/null | grep "Station" | awk '{print $2}')"
-        
-        if [ -n "$mac_list" ]; then
-            local dev_json=""
-            for mac in $mac_list; do
-                mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
-                local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
-                [ -z "$ip" ] && ip="unknown"
-                # Используем printf для безопасного создания JSON объекта
-                local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "unknown")
-                dev_json="${dev_json}${dev_obj},"
-            done
-            # Убираем последнюю запятую и оборачиваем в массив
-            dev_json=$(echo "$dev_json" | sed 's/,$//')
-            devices_json="[$dev_json]"
-        fi
-    fi
+    text = (
+        f"🔐 Код подключения роутера:\n\n"
+        f"`{code}`\n\n"
+        f"Действует 15 минут.\n\n"
+        f"🚀 Быстрая установка (локальная сеть):\n"
+        f"```\n"
+        f"curl -sS {github_agent_url} -o /tmp/agent3.sh && chmod +x /tmp/agent3.sh && /tmp/agent3.sh pair --code {code} --url {pi_url}\n"
+        f"```\n\n"
+        f"🌐 Для роутеров в другой сети (интернет):\n"
+        f"```\n"
+        f"curl -sS {github_agent_url} -o /tmp/agent3.sh && chmod +x /tmp/agent3.sh && /tmp/agent3.sh pair --code {code} --url {pi_url_public}\n"
+        f"```\n"
+    )
+    await message.reply(text)
 
-    # Отправка устройств на /devices
-    curl -sS -4 -X POST "$PI_URL/devices" \
-        -H "Content-Type: application/json" \
-        -H "X-Agent-Secret: $AGENT_SECRET" \
-        -d "{\"router_id\":\"$router_id\",\"devices\":$devices_json,\"timestamp\":$timestamp}" >/dev/null 2>&1
-    echo ""
 
-    # Отправка health-check на /health
-    curl -sS -4 -X POST "$PI_URL/health" \
-        -H "Content-Type: application/json" \
-        -H "X-Agent-Secret: $AGENT_SECRET" \
-        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu_escaped\",\"ram\":\"$ram_escaped\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status_escaped\",\"podkop_test\":$podkop_test,\"timestamp\":$timestamp}"
-    echo ""
-}
+# --- /routers ---
+@dp.message(Command("routers"))
+async def cmd_routers(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    routers = get_user_routers(message.from_user.id)
+    if not routers:
+        await message.reply("📭 У вас ещё нет роутеров. Добавьте: /add_router")
+        return
+    lines = ["🖥️ *Мои роутеры:*"]
+    builder = InlineKeyboardBuilder()
+    for r in routers:
+        online = fmt_online(r['online'])
+        dev_count = get_user_devices_count(message.from_user.id, r['router_id'])
+        lines.append(f"• {r['name'] or r['router_id']} — {online} (устройств: {dev_count}, MAC: {r['mac'] or 'н/д'})")
+        builder.button(text=f"🗑 {r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
+    await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
 
-# --- wifi-monitor ---
-cmd_wifi_monitor() {
-    local router_id=$(get_router_id)
-    if [ -z "$router_id" ]; then
-        log "Роутер не зарегистрирован. Выполните pair."
-        exit 1
-    fi
 
-    log "Запуск wifi-monitor (hostapd_cli)..."
-
-    # Мониторинг событий Wi-Fi (только беспроводные подключения)
-    hostapd_cli -i wlan0 -i wlan1 -a /usr/bin/netwatch-agent-hostapd.sh 2>/dev/null &
-
-    # Пишем PID для возможности остановки
-    echo $! > /var/run/netwatch-wifi-monitor.pid
-    log "wifi-monitor запущен (PID: $(cat /var/run/netwatch-wifi-monitor.pid))"
-
-    # Ждём
-    wait
-}
-
-# --- uninstall ---
-cmd_uninstall() {
-    log "Удаление NetWatch Agent..."
+# --- Удаление роутера с подтверждением ---
+@dp.callback_query(F.data.startswith("del_router_"))
+async def callback_del_router(callback: CallbackQuery):
+    router_id = callback.data.replace("del_router_", "")
     
-    # Остановка сервисов
-    /etc/init.d/netwatch-wifi-monitor stop 2>/dev/null || true
-    kill $(cat /var/run/netwatch-wifi-monitor.pid 2>/dev/null) 2>/dev/null || true
-    rm -f /var/run/netwatch-wifi-monitor.pid
+    # Проверка: роутер должен принадлежать этому пользователю
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ У вас нет прав на удаление этого роутера")
+        return
     
-    # Удаление cron
-    crontab -l 2>/dev/null | grep -v agent3.sh | crontab -
-    
-    # Удаление конфига и логов
-    rm -f /etc/netwatch/config
-    rm -f /mnt/usb/log/netwatch/netwatch-agent.log
-    rm -rf /etc/netwatch
-    
-    echo "Агент полностью удалён с роутера"
-}
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, удалить", callback_data=f"confirm_del_{router_id}")
+    builder.button(text="❌ Отмена", callback_data="cancel_del")
+    await callback.message.edit_text(
+        f"⚠️ Удалить роутер `{router_id}`?\nВсе данные (устройства, события, health-check) будут удалены.",
+        parse_mode="Markdown",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
 
-# --- get_router_id из файла ---
-get_router_id() {
-    if [ -f /etc/netwatch/router_id ]; then
-        cat /etc/netwatch/router_id
-    elif [ -f /etc/netwatch/config ] && grep -q '^ROUTER_ID=' /etc/netwatch/config; then
-        grep '^ROUTER_ID=' /etc/netwatch/config | cut -d'=' -f2- | sed 's/^"//; s/"$//'
-    fi
-}
 
-# --- Главное меню ---
-case "$1" in
-    pair)
-        shift
-        cmd_pair "$@"
-        ;;
-    run)
-        cmd_run
-        ;;
-    wifi-monitor)
-        cmd_wifi_monitor
-        ;;
-    health-check)
-        cmd_run
-        ;;
-    uninstall)
-        cmd_uninstall
-        ;;
-    *)
-        echo "NetWatch Agent v3 (OpenWrt)"
-        echo "Использование: $0 {pair|run|wifi-monitor|health-check|uninstall}"
-        echo ""
-        echo "  pair          -- Регистрация роутера на Pi + авто-установка агента"
-        echo "  run           -- Health-check + heartbeat (cron) + отправка устройств"
-        echo "  wifi-monitor  -- Мониторинг Wi-Fi в реальном времени (hostapd_cli)"
-        echo "  health-check  -- Проверка здоровья роутера (интернет, Wi-Fi, CPU, RAM, клиенты, Podkop)"
-        echo "  uninstall     -- Полное удаление агента с роутера"
-        ;;
-esac
+@dp.callback_query(F.data.startswith("confirm_del_"))
+async def callback_confirm_delete(callback: CallbackQuery):
+    router_id = callback.data.replace("confirm_del_", "")
+    
+    # Проверка: роутер должен принадлежать этому пользователю
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ У вас нет прав на удаление этого роутера")
+        return
+    
+    # Удалить роутер и все связанные данные
+    delete_router_complete(router_id)
+    
+    # Показать команду для ручного удаления агента
+    rm_cmd = (
+        f"📋 *Роутер `{router_id}` удалён из базы.*\n\n"
+        f"Для полного удаления агента с роутера выполните на нём:\n"
+        f"```\n"
+        f"rm -f /etc/netwatch/config\n"
+        f"rm -f /tmp/agent3.sh\n"
+        f"rm -f /mnt/usb/log/netwatch/netwatch-agent.log\n"
+        f"rm -f /var/run/netwatch-wifi-monitor.pid\n"
+        f"```\n"
+        f"ИЛИ просто переподключите роутер:"
+    )
+    await callback.message.edit_text(rm_cmd, parse_mode="Markdown")
+    await callback.answer("✅ Роутер удалён")
+
+
+@dp.callback_query(F.data == "cancel_del")
+async def callback_cancel_delete(callback: CallbackQuery):
+    await callback.message.edit_text("❌ Удаление отменено")
+    await callback.answer()
+
+
+# --- /devices ---
+@dp.message(Command("devices"))
+async def cmd_devices(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    devices = get_user_devices(message.from_user.id)
+    if not devices:
+        await message.reply("📭 Нет Wi-Fi устройств. Подключите роутер: /add_router")
+        return
+    builder = InlineKeyboardBuilder()
+    lines = ["📱 *Мои Wi-Fi устройства:*"]
+    for d in devices:
+        status = "🟢" if d["online"] else "🔴"
+        name = d["custom_name"] or d["hostname"] or "неизвестно"
+        lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
+        builder.button(
+            text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
+            callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
+        )
+    builder.adjust(1)
+    await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+# --- Device detail callback ---
+@dp.callback_query(F.data.startswith("device_detail|"))
+async def callback_device_detail(callback: CallbackQuery):
+    parts = callback.data.split("|")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    device = get_device(callback.from_user.id, mac.lower(), router_id)
+    if not device:
+        await callback.answer("❌ Устройство не найдено")
+        return
+    
+    status = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
+    watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔕 Уведомления: ВЫКЛ"
+    name = device["custom_name"] or device["hostname"] or "неизвестно"
+    
+    text = (
+        f"📱 *Устройство*\n\n"
+        f"• MAC: `{device['mac']}`\n"
+        f"• Имя: {name}\n"
+        f"• IP: {device['ip'] or 'н/д'}\n"
+        f"• Роутер: {device['router_name'] or router_id}\n"
+        f"• Статус: {status}\n"
+        f"• {watch}\n"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Переименовать", callback_data=f"device_rename:{mac}:{router_id}")
+    builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify:{mac}:{router_id}")
+    builder.button(text="◀ Назад к списку", callback_data="device_back_list")
+    builder.adjust(2, 1)
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# --- Device back to list ---
+@dp.callback_query(F.data == "device_back_list")
+async def callback_device_back(callback: CallbackQuery):
+    devices = get_user_devices(callback.from_user.id)
+    if not devices:
+        await callback.message.edit_text("📭 Нет Wi-Fi устройств.")
+        await callback.answer()
+        return
+    builder = InlineKeyboardBuilder()
+    lines = ["📱 *Мои Wi-Fi устройства:*"]
+    for d in devices:
+        status = "🟢" if d["online"] else "🔴"
+        name = d["custom_name"] or d["hostname"] or "неизвестно"
+        lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
+        builder.button(
+            text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
+            callback_data=f"device_detail:{d['mac']}:{d['router_id']}"
+        )
+    builder.adjust(1)
+    await callback.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# --- Device rename: ask for new name ---
+@dp.callback_query(F.data.startswith("device_rename|"))
+async def callback_device_rename(callback: CallbackQuery):
+    parts = callback.data.split("|")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    device = get_device(callback.from_user.id, mac.lower(), router_id)
+    if not device:
+        await callback.answer("⛔ Нет доступа")
+        return
+    
+    await callback.message.edit_text(
+        f"✏️ Введите новое имя для устройства `{mac}`:\n\n"
+        f"Отправьте сообщение с новым именем.",
+        parse_mode="Markdown"
+    )
+    # Store state: user is waiting to rename this device
+    callback.from_user._pending_rename = {"mac": mac, "router_id": router_id}
+    await callback.answer()
+
+
+# --- Device toggle notifications ---
+@dp.callback_query(F.data.startswith("device_notify|"))
+async def callback_device_notify(callback: CallbackQuery):
+    parts = callback.data.split("|")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    new_val = toggle_device_watch_online(mac, router_id)
+    status = "ВКЛ" if new_val else "ВЫКЛ"
+    await callback.answer(f"Уведомления {status}")
+    
+    # Refresh detail view
+    device = get_device(callback.from_user.id, mac.lower(), router_id)
+    if device:
+        watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔔 Уведомления: ВЫКЛ"
+        name = device["custom_name"] or device["hostname"] or "неизвестно"
+        stat = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
+        text = (
+            f"📱 *Устройство*\n\n"
+            f"• MAC: `{device['mac']}`\n"
+            f"• Имя: {name}\n"
+            f"• IP: {device['ip'] or 'н/д'}\n"
+            f"• Роутер: {device['router_name'] or router_id}\n"
+            f"• Статус: {stat}\n"
+            f"• {watch}\n"
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✏️ Переименовать", callback_data=f"device_rename|{mac}|{router_id}")
+        builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify|{mac}|{router_id}")
+        builder.button(text="◀ Назад к списку", callback_data="device_back_list")
+        builder.adjust(2, 1)
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+# --- Handle text input for rename ---
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_pending_rename(message: Message):
+    user = message.from_user
+    pending = getattr(user, "_pending_rename", None)
+    if not pending:
+        return
+    
+    mac = pending["mac"]
+    router_id = pending["router_id"]
+    new_name = message.text.strip()
+    
+    if not new_name:
+        await message.reply("❌ Имя не может быть пустым")
+        return
+    
+    set_device_custom_name(mac, router_id, new_name)
+    user._pending_rename = None
+    
+    await message.reply(f"✅ Устройство `{mac}` переименовано в *{new_name}*", parse_mode="Markdown")
+
+
+# --- /settings ---
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    devices = get_user_devices(message.from_user.id)
+    if not devices:
+        await message.reply("📭 Нет устройств для настройки.")
+        return
+    builder = InlineKeyboardBuilder()
+    for d in devices:
+        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
+        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify|{d['mac']}|{d['router_id']}")
+    await message.reply("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
+
+
+# --- Toggle notifications (from /settings) ---
+@dp.callback_query(F.data.startswith("toggle_notify|"))
+async def callback_toggle_notify(callback: CallbackQuery):
+    parts = callback.data.split("|")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ Нет доступа")
+        return
+    
+    new_val = toggle_device_watch_online(mac, router_id)
+    status = "ВКЛ" if new_val else "ВЫКЛ"
+    await callback.answer(f"Уведомления {status}")
+    
+    # Refresh settings list
+    devices = get_user_devices(callback.from_user.id)
+    builder = InlineKeyboardBuilder()
+    for d in devices:
+        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
+        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify|{d['mac']}|{d['router_id']}")
+    builder.adjust(1)
+    await callback.message.edit_text("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
+
+
+# --- /guide ---
+@dp.message(Command("guide"))
+async def cmd_guide(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    text = (
+        "📖 *Инструкция NetWatch*\n\n"
+        "1. Добавьте роутер: /add_router\n"
+        "2. Подключитесь к роутеру по SSH и выполните команду с кодом\n"
+        "3. Через 1 минуту роутер появится в списке: /routers\n"
+        "4. Просматривайте устройства: /devices\n"
+        "5. История событий: /history\n"
+        "6. Статус здоровья: /health\n"
+    )
+    await message.reply(text, parse_mode="Markdown")
+
+
+# --- /history ---
+@dp.message(Command("history"))
+async def cmd_history(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    events = get_user_events(message.from_user.id, hours=24)
+    if not events:
+        await message.reply("📭 Нет событий за последние 24 часа.")
+        return
+    lines = ["📜 *История событий (24ч):*"]
+    for e in events[:50]:
+        t = fmt_time(e["timestamp"])
+        evt = "🟢 подключился" if "CONNECTED" in e["event"].upper() else "🔴 отключился"
+        lines.append(f"{t} — {e.get('router_name', e['router_id'])}: {e['mac']} {evt}")
+    await message.reply("\n".join(lines), parse_mode="Markdown")
+
+
+# --- /health ---
+@dp.message(Command("health"))
+async def cmd_health(message: Message):
+    upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    routers = get_user_routers(message.from_user.id)
+    if not routers:
+        await message.reply("📭 У вас нет роутеров.")
+        return
+    lines = ["🩺 *Статус здоровья роутеров:*"]
+    for r in routers:
+        h = get_latest_health(r["router_id"])
+        if h:
+            net = "✅" if h["internet"] else "❌"
+            wf = "✅" if h["wifi"] else "❌"
+            pk = "✅" if h["podkop_test"] else "⚠️"
+            lines.append(
+                f"• {r['name'] or r['router_id']}:\n"
+                f"  Интернет: {net} | Wi-Fi: {wf} | CPU: {h['cpu'] or 'н/д'} | "
+                f"RAM: {h['ram'] or 'н/д'} | Клиенты: {h['wifi_clients']}\n"
+                f"  Podkop: {h['podkop_status'] or 'н/д'} (test: {pk})"
+            )
+        else:
+            lines.append(f"• {r['name'] or r['router_id']}: ⏳ нет данных о health-check")
+    await message.reply("\n".join(lines), parse_mode="Markdown")
+
+
+# --- /admin ---
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("⛔ Доступ запрещён. Только для администратора.")
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👥 Список пользователей", callback_data="admin_list_users")
+    builder.button(text="🧹 Очистить данные пользователя", callback_data="admin_clean_prompt")
+    await message.reply("🔐 Админ-панель:\nВыберите действие:", reply_markup=builder.as_markup())
+
+
+# --- Admin callbacks ---
+@dp.callback_query(F.data == "admin_list_users")
+async def admin_list_users(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа")
+        return
+    users = get_all_users()
+    if not users:
+        await callback.message.edit_text("📭 Нет пользователей.")
+        await callback.answer()
+        return
+    lines = ["👥 *Все пользователи:*"]
+    for u in users:
+        admin_tag = " (👑 админ)" if u["is_admin"] else ""
+        lines.append(f"`{u['chat_id']}` {u['username'] or ''} {u['first_name'] or ''}{admin_tag}")
+    lines.append("\nУдалить пользователя:\n`/admin_clean_user <chat_id> del`")
+    lines.append("Очистить данные:\n`/admin_clean_user <chat_id> clean`")
+    await callback.message.edit_text("\n".join(lines), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.message(F.text.regexp(r"^/admin_clean_user\s+\d+\s+(del|clean)$"))
+async def admin_clean_input(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    try:
+        chat_id = int(parts[1])
+        action = parts[2]
+        if action == "del":
+            delete_user(chat_id)
+            await message.reply(f"✅ Пользователь {chat_id} удалён вместе с данными.")
+        elif action == "clean":
+            clean_user_data(chat_id)
+            await message.reply(f"🧹 Данные пользователя {chat_id} очищены (роутеры, устройства, события, health-check).")
+    except ValueError:
+        await message.reply("❌ Неверный chat_id")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+
+
+# --- Bot commands setup ---
+async def set_commands():
+    await bot.set_my_commands([
+        types.BotCommand(command="start", description="Начать работу"),
+        types.BotCommand(command="add_router", description="Добавить роутер"),
+        types.BotCommand(command="routers", description="Мои роутеры"),
+        types.BotCommand(command="devices", description="Wi-Fi устройства"),
+        types.BotCommand(command="settings", description="Настройки уведомлений"),
+        types.BotCommand(command="guide", description="Инструкция"),
+        types.BotCommand(command="history", description="История событий (24ч)"),
+        types.BotCommand(command="health", description="Статус здоровья роутеров"),
+        types.BotCommand(command="admin", description="Админ-панель"),
+    ])
+
+
+if __name__ == "__main__":
+    async def main():
+        init_db()
+        for aid in ADMIN_IDS:
+            set_admin(aid, True)
+        await set_commands()
+        logging.info("NetWatch bot starting...")
+        await dp.start_polling(bot)
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

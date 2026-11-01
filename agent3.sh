@@ -149,10 +149,26 @@ cmd_run() {
     local ram_escaped=$(json_escape "$ram")
     local podkop_status_escaped=$(json_escape "$podkop_status")
 
-    # Сбор устройств для /devices endpoint
+    # Сбор устройств для /devices endpoint (DHCP leases + ARP-table, fallback on iw)
     local devices_json="[]"
-    if command -v iw > /dev/null 2>&1; then
-        # Получаем MAC адреса клиентов с wlan0 и wlan1
+    if [ -f /var/lib/dhcp/leases ]; then
+        # DHCP leases: MAC, IP, hostname
+        local leases=$(cat /var/lib/dhcp/leases 2>/dev/null | awk '{print $2, $3, $4}' | while read mac ip hostname; do
+            [ -n "$mac" ] && [ -n "$ip" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"$hostname\"}"
+        done | tr '\n' ',' | sed 's/,$//')
+        [ -n "$leases" ] && devices_json="[$leases]"
+    fi
+
+    # Fallback: ARP-таблица, если DHCP leases пусты
+    if [ "$devices_json" = "[]" ]; then
+        local arp_list=$(arp -a 2>/dev/null | awk '{print $2, $3}' | sed 's/[()]//g' | while read ip mac; do
+            [ -n "$ip" ] && [ -n "$mac" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"}"
+        done | tr '\n' ',' | sed 's/,$//')
+        [ -n "$arp_list" ] && devices_json="[$arp_list]"
+    fi
+    
+    # Fallback: iw (Wi-Fi clients only)
+    if [ "$devices_json" = "[]" ] && command -v iw > /dev/null 2>&1; then
         local mac_list=$(iw dev wlan0 station dump 2>/dev/null | grep "Station" | awk '{print $2}')
         mac_list="$mac_list $(iw dev wlan1 station dump 2>/dev/null | grep "Station" | awk '{print $2}')"
         

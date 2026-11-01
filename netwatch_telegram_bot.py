@@ -210,7 +210,7 @@ async def cmd_devices(message: Message):
                 callback_data=f"device_detail|{d['mac']}|{r['router_id']}"
             )
     builder.adjust(1)
-    await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+    await message.reply("\n".join(lines), reply_markup=builder.as_markup())
 
 
 # --- Device detail callback ---
@@ -269,7 +269,7 @@ async def callback_device_back(callback: CallbackQuery):
             callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
         )
     builder.adjust(1)
-    await callback.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+    await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
     await callback.answer()
 
 

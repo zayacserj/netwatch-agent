@@ -227,8 +227,8 @@ async def callback_device_detail(callback: CallbackQuery):
     )
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Переименовать", callback_data=f"device_rename:{mac}:{router_id}")
-    builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify:{mac}:{router_id}")
+    builder.button(text="✏️ Переименовать", callback_data=f"device_rename|{mac}|{router_id}")
+    builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify|{mac}|{router_id}")
     builder.button(text="◀ Назад к списку", callback_data="device_back_list")
     builder.adjust(2, 1)
     
@@ -252,7 +252,7 @@ async def callback_device_back(callback: CallbackQuery):
         lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
         builder.button(
             text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
-            callback_data=f"device_detail:{d['mac']}:{d['router_id']}"
+            callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
         )
     builder.adjust(1)
     await callback.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())

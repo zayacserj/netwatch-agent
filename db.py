@@ -44,7 +44,9 @@ def init_db():
         router_id TEXT,
         ip TEXT,
         hostname TEXT,
+        custom_name TEXT,
         online INTEGER DEFAULT 0,
+        watch_online INTEGER DEFAULT 1,
         first_seen INTEGER DEFAULT (unixepoch()),
         last_seen INTEGER DEFAULT (unixepoch()),
         PRIMARY KEY (mac, router_id),
@@ -95,6 +97,16 @@ def init_db():
         FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
     );
     """)
+    conn.commit()
+    conn.close()
+
+    # Миграция: добавить новые колонки если таблица уже существует
+    conn = get_conn()
+    columns = [col["name"] for col in conn.execute("PRAGMA table_info(devices)").fetchall()]
+    if "custom_name" not in columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
+    if "watch_online" not in columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
     conn.commit()
     conn.close()
 
@@ -244,6 +256,37 @@ def set_device_online(mac, router_id, online=True):
     conn.execute("UPDATE devices SET online=? WHERE mac=? AND router_id=?", (1 if online else 0, mac, router_id))
     conn.commit()
     conn.close()
+
+
+def get_device(chat_id, mac, router_id):
+    """Get single device by MAC and router for user"""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT d.*, r.name AS router_name
+        FROM devices d
+        JOIN routers r ON d.router_id = r.router_id
+        WHERE r.chat_id=? AND d.mac=? AND d.router_id=?
+    """, (chat_id, mac.lower(), router_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_device_custom_name(mac, router_id, custom_name):
+    conn = get_conn()
+    conn.execute("UPDATE devices SET custom_name=? WHERE mac=? AND router_id=?", (custom_name, mac.lower(), router_id))
+    conn.commit()
+    conn.close()
+
+
+def toggle_device_watch_online(mac, router_id):
+    conn = get_conn()
+    row = conn.execute("SELECT watch_online FROM devices WHERE mac=? AND router_id=?", (mac.lower(), router_id)).fetchone()
+    if row:
+        new_val = 0 if row["watch_online"] else 1
+        conn.execute("UPDATE devices SET watch_online=? WHERE mac=? AND router_id=?", (new_val, mac.lower(), router_id))
+        conn.commit()
+    conn.close()
+    return new_val if row else None
 
 
 # --- events ---

@@ -151,9 +151,9 @@ cmd_run() {
 
     # Сбор устройств для /devices endpoint (DHCP leases + ARP-table, fallback on iw)
     local devices_json="[]"
-    if [ -f /var/lib/dhcp/leases ]; then
+    if [ -f /tmp/dhcp.leases ]; then
         # DHCP leases: MAC, IP, hostname
-        local leases=$(cat /var/lib/dhcp/leases 2>/dev/null | awk '{print $2, $3, $4}' | while read mac ip hostname; do
+        local leases=$(cat /tmp/dhcp.leases 2>/dev/null | awk '{print $2, $3, $4}' | while read mac ip hostname; do
             [ -n "$mac" ] && [ -n "$ip" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"$hostname\"}"
         done | tr '\n' ',' | sed 's/,$//')
         [ -n "$leases" ] && devices_json="[$leases]"

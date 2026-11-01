@@ -64,11 +64,12 @@ async def post_event(request):
     now = int(time.time())
     if "CONNECTED" in event.upper():
         conn.execute("""
-            INSERT INTO devices (mac, router_id, ip, hostname, online, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
+            INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(mac, router_id) DO UPDATE SET
-                online=1, last_seen=excluded.last_seen
-        """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), now, now))
+                online=1, last_seen=excluded.last_seen,
+                ip=excluded.ip, hostname=excluded.hostname, custom_name=excluded.custom_name
+        """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
     elif "DISCONNECTED" in event.upper():
         conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
                      (now, mac, data["router_id"]))
@@ -96,14 +97,15 @@ async def post_devices(request):
         if not mac:
             continue
         conn.execute("""
-            INSERT INTO devices (mac, router_id, ip, hostname, online, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
+            INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(mac, router_id) DO UPDATE SET
                 ip=excluded.ip,
                 hostname=excluded.hostname,
+                custom_name=excluded.custom_name,
                 online=1,
                 last_seen=excluded.last_seen
-        """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), now, now))
+        """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), dev.get("custom_name"), now, now))
         saved += 1
     conn.commit()
     conn.close()

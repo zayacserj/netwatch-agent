@@ -23,6 +23,7 @@ from db import (
     init_db, upsert_user, is_admin, set_admin, get_all_users, delete_user, clean_user_data,
     upsert_router, get_user_routers, get_all_routers, set_router_online,
     get_user_devices, get_user_devices_count, set_device_online,
+    get_device, set_device_custom_name, toggle_device_watch_online,
     add_event, get_user_events,
     get_latest_health, get_user_health, add_health_check,
     create_pairing_code, get_pairing_code, consume_pairing_code,
@@ -185,12 +186,165 @@ async def cmd_devices(message: Message):
     if not devices:
         await message.reply("📭 Нет Wi-Fi устройств. Подключите роутер: /add_router")
         return
+    builder = InlineKeyboardBuilder()
     lines = ["📱 *Мои Wi-Fi устройства:*"]
     for d in devices:
         status = "🟢" if d["online"] else "🔴"
-        hostname = d["hostname"] or "неизвестно"
-        lines.append(f"{status} `{d['mac']}` — {hostname} ({d.get('router_name', 'н/д')})")
-    await message.reply("\n".join(lines), parse_mode="Markdown")
+        name = d["custom_name"] or d["hostname"] or "неизвестно"
+        lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
+        builder.button(
+            text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
+            callback_data=f"device_detail:{d['mac']}:{d['router_id']}"
+        )
+    builder.adjust(1)
+    await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+# --- Device detail callback ---
+@dp.callback_query(F.data.startswith("device_detail:"))
+async def callback_device_detail(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    # Verify ownership
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ Нет доступа к этому устройству")
+        return
+    
+    device = get_device(callback.from_user.id, mac, router_id)
+    if not device:
+        await callback.answer("❌ Устройство не найдено")
+        return
+    
+    status = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
+    watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔕 Уведомления: ВЫКЛ"
+    name = device["custom_name"] or device["hostname"] or "неизвестно"
+    
+    text = (
+        f"📱 *Устройство*\n\n"
+        f"• MAC: `{device['mac']}`\n"
+        f"• Имя: {name}\n"
+        f"• IP: {device['ip'] or 'н/д'}\n"
+        f"• Роутер: {device['router_name'] or router_id}\n"
+        f"• Статус: {status}\n"
+        f"• {watch}\n"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Переименовать", callback_data=f"device_rename:{mac}:{router_id}")
+    builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify:{mac}:{router_id}")
+    builder.button(text="◀ Назад к списку", callback_data="device_back_list")
+    builder.adjust(2, 1)
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# --- Device back to list ---
+@dp.callback_query(F.data == "device_back_list")
+async def callback_device_back(callback: CallbackQuery):
+    devices = get_user_devices(callback.from_user.id)
+    if not devices:
+        await callback.message.edit_text("📭 Нет Wi-Fi устройств.")
+        await callback.answer()
+        return
+    builder = InlineKeyboardBuilder()
+    lines = ["📱 *Мои Wi-Fi устройства:*"]
+    for d in devices:
+        status = "🟢" if d["online"] else "🔴"
+        name = d["custom_name"] or d["hostname"] or "неизвестно"
+        lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
+        builder.button(
+            text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
+            callback_data=f"device_detail:{d['mac']}:{d['router_id']}"
+        )
+    builder.adjust(1)
+    await callback.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+# --- Device rename: ask for new name ---
+@dp.callback_query(F.data.startswith("device_rename:"))
+async def callback_device_rename(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ Нет доступа")
+        return
+    
+    await callback.message.edit_text(
+        f"✏️ Введите новое имя для устройства `{mac}`:\n\n"
+        f"Отправьте сообщение с новым именем.",
+        parse_mode="Markdown"
+    )
+    # Store state: user is waiting to rename this device
+    callback.from_user._pending_rename = {"mac": mac, "router_id": router_id}
+    await callback.answer()
+
+
+# --- Device toggle notifications ---
+@dp.callback_query(F.data.startswith("device_notify:"))
+async def callback_device_notify(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ Нет доступа")
+        return
+    
+    new_val = toggle_device_watch_online(mac, router_id)
+    status = "ВКЛ" if new_val else "ВЫКЛ"
+    await callback.answer(f"Уведомления {status}")
+    # Refresh detail view
+    device = get_device(callback.from_user.id, mac, router_id)
+    if device:
+        watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔕 Уведомления: ВЫКЛ"
+        name = device["custom_name"] or device["hostname"] or "неизвестно"
+        stat = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
+        text = (
+            f"📱 *Устройство*\n\n"
+            f"• MAC: `{device['mac']}`\n"
+            f"• Имя: {name}\n"
+            f"• IP: {device['ip'] or 'н/д'}\n"
+            f"• Роутер: {device['router_name'] or router_id}\n"
+            f"• Статус: {stat}\n"
+            f"• {watch}\n"
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✏️ Переименовать", callback_data=f"device_rename:{mac}:{router_id}")
+        builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify:{mac}:{router_id}")
+        builder.button(text="◀ Назад к списку", callback_data="device_back_list")
+        builder.adjust(2, 1)
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+
+
+# --- Handle text input for rename ---
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_pending_rename(message: Message):
+    user = message.from_user
+    pending = getattr(user, "_pending_rename", None)
+    if not pending:
+        return
+    
+    mac = pending["mac"]
+    router_id = pending["router_id"]
+    new_name = message.text.strip()
+    
+    if not new_name:
+        await message.reply("❌ Имя не может быть пустым")
+        return
+    
+    set_device_custom_name(mac, router_id, new_name)
+    user._pending_rename = None
+    
+    await message.reply(f"✅ Устройство `{mac}` переименовано в *{new_name}*", parse_mode="Markdown")
 
 
 # --- /settings ---
@@ -203,9 +357,35 @@ async def cmd_settings(message: Message):
         return
     builder = InlineKeyboardBuilder()
     for d in devices:
-        watch = "🔔 Отключить" if d.get("watch_online") else "🔕 Включить"
+        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔕 Включить"
         builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify:{d['mac']}:{d['router_id']}")
     await message.reply("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
+
+
+# --- Toggle notifications (from /settings) ---
+@dp.callback_query(F.data.startswith("toggle_notify:"))
+async def callback_toggle_notify(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    mac = parts[1]
+    router_id = parts[2]
+    
+    user_routers = get_user_routers(callback.from_user.id)
+    if not any(r["router_id"] == router_id for r in user_routers):
+        await callback.answer("⛔ Нет доступа")
+        return
+    
+    new_val = toggle_device_watch_online(mac, router_id)
+    status = "ВКЛ" if new_val else "ВЫКЛ"
+    await callback.answer(f"Уведомления {status}")
+    
+    # Refresh settings list
+    devices = get_user_devices(callback.from_user.id)
+    builder = InlineKeyboardBuilder()
+    for d in devices:
+        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
+        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify:{d['mac']}:{d['router_id']}")
+    builder.adjust(1)
+    await callback.message.edit_text("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
 
 
 # --- /guide ---

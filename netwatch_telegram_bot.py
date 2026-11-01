@@ -83,7 +83,7 @@ async def cmd_add_router(message: Message):
     code = secrets.token_hex(4)  # 8 hex chars = 4 bytes
     create_pairing_code(code, message.from_user.id, expires_sec=900)
 
-    github_agent_url = "https://raw.githubusercontent.com/zayacserj/netwatch-agent/main/agent3.sh"
+    github_agent_url = "https://raw.githubusercontent.com/zayacserj/netwatch-agent/master/deploy_files/agent3_fixed.sh"
     pi_url = os.getenv("PI_URL", "http://192.168.10.222:8080")
     pi_url_public = os.getenv("PI_URL_PUBLIC", "http://95.31.29.233:8080")
     

@@ -168,20 +168,24 @@ cmd_run() {
     done | tr '\n' ',' | sed 's/,$//')
     [ -n "$arp_list" ] && all_devices="${all_devices}${arp_list},"
 
-    # 3. Associated Stations (Wi-Fi clients) - всегда проверяем
+    # 3. Associated Stations (Wi-Fi clients) - всегда проверяем, динамически определяем интерфейсы
     if command -v iw > /dev/null 2>&1; then
-        local mac_list=$(iw dev wlan0 station dump 2>/dev/null | grep "Station" | awk '{print $2}')
-        mac_list="$mac_list $(iw dev wlan1 station dump 2>/dev/null | grep "Station" | awk '{print $2}')"
+        # Получаем список всех беспроводных интерфейсов
+        local iface_list=$(iw dev 2>/dev/null | grep "Interface" | awk '{print $2}')
         
-        if [ -n "$mac_list" ]; then
-            for mac in $mac_list; do
-                mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
-                local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
-                [ -z "$ip" ] && ip="unknown"
-                local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "unknown")
-                all_devices="${all_devices}${dev_obj},"
-            done
-        fi
+        for iface in $iface_list; do
+            local mac_list=$(iw dev "$iface" station dump 2>/dev/null | grep "Station" | awk '{print $2}')
+            
+            if [ -n "$mac_list" ]; then
+                for mac in $mac_list; do
+                    mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
+                    local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
+                    [ -z "$ip" ] && ip="unknown"
+                    local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "unknown")
+                    all_devices="${all_devices}${dev_obj},"
+                done
+            fi
+        done
     fi
 
     # Убираем последнюю запятую и формируем JSON

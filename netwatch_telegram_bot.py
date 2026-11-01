@@ -207,13 +207,7 @@ async def callback_device_detail(callback: CallbackQuery):
     mac = parts[1]
     router_id = parts[2]
     
-    # Verify ownership
-    user_routers = get_user_routers(callback.from_user.id)
-    if not any(r["router_id"] == router_id for r in user_routers):
-        await callback.answer("⛔ Нет доступа к этому устройству")
-        return
-    
-    device = get_device(callback.from_user.id, mac, router_id)
+    device = get_device(callback.from_user.id, mac.lower(), router_id)
     if not device:
         await callback.answer("❌ Устройство не найдено")
         return
@@ -272,8 +266,8 @@ async def callback_device_rename(callback: CallbackQuery):
     mac = parts[1]
     router_id = parts[2]
     
-    user_routers = get_user_routers(callback.from_user.id)
-    if not any(r["router_id"] == router_id for r in user_routers):
+    device = get_device(callback.from_user.id, mac.lower(), router_id)
+    if not device:
         await callback.answer("⛔ Нет доступа")
         return
     
@@ -294,16 +288,12 @@ async def callback_device_notify(callback: CallbackQuery):
     mac = parts[1]
     router_id = parts[2]
     
-    user_routers = get_user_routers(callback.from_user.id)
-    if not any(r["router_id"] == router_id for r in user_routers):
-        await callback.answer("⛔ Нет доступа")
-        return
-    
     new_val = toggle_device_watch_online(mac, router_id)
     status = "ВКЛ" if new_val else "ВЫКЛ"
     await callback.answer(f"Уведомления {status}")
+    
     # Refresh detail view
-    device = get_device(callback.from_user.id, mac, router_id)
+    device = get_device(callback.from_user.id, mac.lower(), router_id)
     if device:
         watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔕 Уведомления: ВЫКЛ"
         name = device["custom_name"] or device["hostname"] or "неизвестно"

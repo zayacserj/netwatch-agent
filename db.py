@@ -388,6 +388,7 @@ def delete_router_complete(router_id):
     conn.execute("DELETE FROM events WHERE router_id=?", (router_id,))
     conn.execute("DELETE FROM devices WHERE router_id=?", (router_id,))
     conn.execute("DELETE FROM router_secrets WHERE router_id=?", (router_id,))
+    conn.execute("DELETE FROM routers WHERE router_id=?", (router_id,))
     conn.commit()
     conn.close()
 

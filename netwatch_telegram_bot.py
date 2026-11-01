@@ -194,16 +194,16 @@ async def cmd_devices(message: Message):
         lines.append(f"{status} `{d['mac']}` — {name} ({d.get('router_name', 'н/д')})")
         builder.button(
             text=f"{'🔔' if d.get('watch_online', 1) else '🔕'} {name or d['mac']} ({d['mac']})",
-            callback_data=f"device_detail:{d['mac']}:{d['router_id']}"
+            callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
         )
     builder.adjust(1)
     await message.reply("\n".join(lines), parse_mode="Markdown", reply_markup=builder.as_markup())
 
 
 # --- Device detail callback ---
-@dp.callback_query(F.data.startswith("device_detail:"))
+@dp.callback_query(F.data.startswith("device_detail|"))
 async def callback_device_detail(callback: CallbackQuery):
-    parts = callback.data.split(":")
+    parts = callback.data.split("|")
     mac = parts[1]
     router_id = parts[2]
     
@@ -260,9 +260,9 @@ async def callback_device_back(callback: CallbackQuery):
 
 
 # --- Device rename: ask for new name ---
-@dp.callback_query(F.data.startswith("device_rename:"))
+@dp.callback_query(F.data.startswith("device_rename|"))
 async def callback_device_rename(callback: CallbackQuery):
-    parts = callback.data.split(":")
+    parts = callback.data.split("|")
     mac = parts[1]
     router_id = parts[2]
     
@@ -282,9 +282,9 @@ async def callback_device_rename(callback: CallbackQuery):
 
 
 # --- Device toggle notifications ---
-@dp.callback_query(F.data.startswith("device_notify:"))
+@dp.callback_query(F.data.startswith("device_notify|"))
 async def callback_device_notify(callback: CallbackQuery):
-    parts = callback.data.split(":")
+    parts = callback.data.split("|")
     mac = parts[1]
     router_id = parts[2]
     
@@ -295,7 +295,7 @@ async def callback_device_notify(callback: CallbackQuery):
     # Refresh detail view
     device = get_device(callback.from_user.id, mac.lower(), router_id)
     if device:
-        watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔕 Уведомления: ВЫКЛ"
+        watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔔 Уведомления: ВЫКЛ"
         name = device["custom_name"] or device["hostname"] or "неизвестно"
         stat = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
         text = (
@@ -308,8 +308,8 @@ async def callback_device_notify(callback: CallbackQuery):
             f"• {watch}\n"
         )
         builder = InlineKeyboardBuilder()
-        builder.button(text="✏️ Переименовать", callback_data=f"device_rename:{mac}:{router_id}")
-        builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify:{mac}:{router_id}")
+        builder.button(text="✏️ Переименовать", callback_data=f"device_rename|{mac}|{router_id}")
+        builder.button(text=watch.split(":")[0].strip() + (" Выключить" if device.get("watch_online", 1) else " Включить"), callback_data=f"device_notify|{mac}|{router_id}")
         builder.button(text="◀ Назад к списку", callback_data="device_back_list")
         builder.adjust(2, 1)
         await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
@@ -347,15 +347,15 @@ async def cmd_settings(message: Message):
         return
     builder = InlineKeyboardBuilder()
     for d in devices:
-        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔕 Включить"
-        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify:{d['mac']}:{d['router_id']}")
+        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
+        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify|{d['mac']}|{d['router_id']}")
     await message.reply("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
 
 
 # --- Toggle notifications (from /settings) ---
-@dp.callback_query(F.data.startswith("toggle_notify:"))
+@dp.callback_query(F.data.startswith("toggle_notify|"))
 async def callback_toggle_notify(callback: CallbackQuery):
-    parts = callback.data.split(":")
+    parts = callback.data.split("|")
     mac = parts[1]
     router_id = parts[2]
     
@@ -373,7 +373,7 @@ async def callback_toggle_notify(callback: CallbackQuery):
     builder = InlineKeyboardBuilder()
     for d in devices:
         watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
-        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify:{d['mac']}:{d['router_id']}")
+        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify|{d['mac']}|{d['router_id']}")
     builder.adjust(1)
     await callback.message.edit_text("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
 

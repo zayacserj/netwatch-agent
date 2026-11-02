@@ -189,6 +189,14 @@ cmd_run() {
                         [ -z "$host" ] && host="unknown"
                     fi
                 fi
+
+                # Fallback для репитеров без DHCP: пытаемся взять IP из ARP-таблицы
+                if [ "$ip" = "unknown" ]; then
+                    local arp_ip=""
+                    arp_ip=$(arp -n 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
+                    [ -z "$arp_ip" ] && arp_ip=$(ip neigh 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
+                    [ -n "$arp_ip" ] && ip="$arp_ip"
+                fi
                 
                 local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "$host")
                 all_devices="${all_devices}${dev_obj},"

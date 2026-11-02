@@ -87,23 +87,28 @@ async def post_devices(request):
     
     if "router_id" not in data or "devices" not in data:
         return web.json_response({"error": "Missing router_id or devices"}, status=400)
-    
+
     conn = get_conn()
     now = int(time.time())
+
+    # Сначала помечаем все устройства этого роутера как оффлайн
+    conn.execute("UPDATE devices SET online=0 WHERE router_id=?", (data["router_id"],))
+
     saved = 0
     for dev in data["devices"]:
         mac = dev.get("mac", "").lower()
         if not mac:
             continue
         conn.execute("""
-            INSERT INTO devices (mac, router_id, ip, hostname, online, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
+            INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(mac, router_id) DO UPDATE SET
                 ip=excluded.ip,
                 hostname=excluded.hostname,
+                custom_name=excluded.custom_name,
                 online=1,
                 last_seen=excluded.last_seen
-        """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), now, now))
+        """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), dev.get("custom_name"), now, now))
         saved += 1
     conn.commit()
     conn.close()

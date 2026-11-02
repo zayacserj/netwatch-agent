@@ -98,6 +98,16 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # Миграция: добавить новые колонки если таблица уже существует
+    conn = get_conn()
+    columns = [col["name"] for col in conn.execute("PRAGMA table_info(devices)").fetchall()]
+    if "custom_name" not in columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
+    if "watch_online" not in columns:
+        conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
+    conn.commit()
+    conn.close()
+
 
 # --- users ---
 

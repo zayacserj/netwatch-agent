@@ -260,6 +260,14 @@ def get_user_devices_count(chat_id, router_id):
     return row["cnt"] if row else 0
 
 
+def get_user_by_router_id(router_id):
+    """Возвращает chat_id пользователя, которому принадлежит роутер"""
+    conn = get_conn()
+    row = conn.execute("SELECT chat_id FROM routers WHERE router_id=?", (router_id,)).fetchone()
+    conn.close()
+    return row["chat_id"] if row else None
+
+
 def set_device_online(mac, router_id, online=True):
     conn = get_conn()
     conn.execute("UPDATE devices SET online=? WHERE mac=? AND router_id=?", (1 if online else 0, mac, router_id))

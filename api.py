@@ -17,7 +17,7 @@ from aiohttp import web
 
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router, get_conn,
-    is_valid_router_secret
+    is_valid_router_secret, get_user_by_router_id
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
@@ -28,6 +28,23 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+# --- Telegram notification helper ---
+def send_telegram_notification(chat_id, text):
+    """Отправляет уведомление в Telegram"""
+    import urllib.request
+    import os as _os
+    token = _os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"Telegram notification error: {e}")
+
 
 # --- Middleware: проверка X-Agent-Secret ---
 @web.middleware
@@ -60,9 +77,17 @@ async def post_event(request):
     conn.execute("INSERT INTO events (router_id, mac, event, timestamp) VALUES (?, ?, ?, ?)",
                  (data["router_id"], mac, event, timestamp))
     
+    # Получаем chat_id пользователя этого роутера
+    chat_id = get_user_by_router_id(data["router_id"])
+    
     # Обновляем состояние устройства
     now = int(time.time())
     if "CONNECTED" in event.upper():
+        # Проверяем предыдущий статус
+        prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?",
+                            (mac, data["router_id"])).fetchone()
+        was_online = prev["online"] if prev else 0
+
         conn.execute("""
             INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
             VALUES (?, ?, ?, ?, ?, 1, ?, ?)
@@ -70,9 +95,28 @@ async def post_event(request):
                 online=1, last_seen=excluded.last_seen,
                 ip=excluded.ip, hostname=excluded.hostname, custom_name=excluded.custom_name
         """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
+
+        # Уведомление о подключении, если был оффлайн
+        if chat_id and was_online == 0:
+            device_name = data.get("custom_name") or data.get("hostname") or mac
+            send_telegram_notification(chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}")
+
     elif "DISCONNECTED" in event.upper():
+        # Проверяем предыдущий статус
+        prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?",
+                            (mac, data["router_id"])).fetchone()
+        was_online = prev["online"] if prev else 0
+        watch_online = prev["watch_online"] if prev else 1
+
         conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
                      (now, mac, data["router_id"]))
+
+        # Уведомление об отключении, если был онлайн и watch_online включен
+        if chat_id and was_online == 1 and watch_online == 1:
+            device_name = conn.execute("SELECT custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
+                                       (mac, data["router_id"])).fetchone()
+            name = (device_name["custom_name"] or device_name["hostname"] or mac) if device_name else mac
+            send_telegram_notification(chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}")
     
     conn.commit()
     conn.close()

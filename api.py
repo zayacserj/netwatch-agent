@@ -44,8 +44,11 @@ def send_telegram_notification(chat_id, text):
     """Отправляет уведомление в Telegram"""
     import urllib.request
     import os as _os
+    import logging
+    logger = logging.getLogger(__name__)
     token = _os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — notification skipped")
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -53,7 +56,7 @@ def send_telegram_notification(chat_id, text):
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=5)
     except Exception as e:
-        print(f"Telegram notification error: {e}")
+        logger.error(f"Telegram notification failed: {e}")
 
 
 # --- Middleware: проверка X-Agent-Secret ---

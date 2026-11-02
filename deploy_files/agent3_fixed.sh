@@ -114,11 +114,22 @@ cmd_run() {
         internet=0
     fi
 
-    # Проверка Wi-Fi (hostapd_cli)
-    if hostapd_cli status > /dev/null 2>&1; then
+    # Проверка Wi-Fi (hostapd_cli) — проверяем все Wi-Fi интерфейсы
+    local wifi_interface_found=0
+    local wifi_clients_total=0
+    if command -v iwinfo > /dev/null 2>&1; then
+        local iface_list=$(iwinfo 2>/dev/null | grep ESSID | cut -f 1 -s -d" ")
+        for iface in $iface_list; do
+            if hostapd_cli -i "$iface" status > /dev/null 2>&1; then
+                wifi_interface_found=1
+                local iface_clients=$(hostapd_cli -i "$iface" all_sta 2>/dev/null | grep -c "SSID=" || echo 0)
+                wifi_clients_total=$((wifi_clients_total + iface_clients))
+            fi
+        done
+    fi
+    if [ "$wifi_interface_found" = "1" ]; then
         wifi_status=1
-        # Количество подключённых Wi-Fi клиентов
-        wifi_clients=$(hostapd_cli all_sta 2>/dev/null | grep -c "SSID=" || echo 0)
+        wifi_clients=$wifi_clients_total
     else
         wifi_status=0
     fi
@@ -150,41 +161,38 @@ cmd_run() {
     local ram_escaped=$(json_escape "$ram")
     local podkop_status_escaped=$(json_escape "$podkop_status")
 
-    # Сбор устройств для /devices endpoint (DHCP leases + ARP-table + Associated Stations iw)
+    # Сбор устройств для /devices endpoint (Associated Stations via iwinfo + DHCP leases correlation)
+    # iwinfo — универсальный интерфейс OpenWrt, работает со всеми драйверами (mac80211, Broadcom wl и т.д.)
     local devices_json="[]"
     local all_devices=""
 
-    # 1. DHCP leases: MAC, IP, hostname
-    if [ -f /tmp/dhcp.leases ]; then
-        local leases=$(cat /tmp/dhcp.leases 2>/dev/null | awk '{print $2, $3, $4}' | while read mac ip hostname; do
-            [ -n "$mac" ] && [ -n "$ip" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"$hostname\"}"
-        done | tr '\n' ',' | sed 's/,$//')
-        [ -n "$leases" ] && all_devices="${all_devices}${leases},"
-    fi
-
-    # 2. ARP-таблица
-    local arp_list=$(arp -a 2>/dev/null | awk '{print $2, $3}' | sed 's/[()]//g' | while read ip mac; do
-        [ -n "$ip" ] && [ -n "$mac" ] && echo "{\"mac\":\"$mac\",\"ip\":\"$ip\",\"hostname\":\"unknown\"}"
-    done | tr '\n' ',' | sed 's/,$//')
-    [ -n "$arp_list" ] && all_devices="${all_devices}${arp_list},"
-
-    # 3. Associated Stations (Wi-Fi clients) - всегда проверяем, динамически определяем интерфейсы
-    if command -v iw > /dev/null 2>&1; then
-        # Получаем список всех беспроводных интерфейсов
-        local iface_list=$(iw dev 2>/dev/null | grep "Interface" | awk '{print $2}')
+    if command -v iwinfo > /dev/null 2>&1; then
+        # Список всех беспроводных интерфейсов
+        local iface_list=$(iwinfo 2>/dev/null | grep ESSID | cut -f 1 -s -d" ")
         
         for iface in $iface_list; do
-            local mac_list=$(iw dev "$iface" station dump 2>/dev/null | grep "Station" | awk '{print $2}')
+            # assoclist показывает ТОЛЬКО ассоциированные (подключенные сейчас) станции с RSSI
+            local mac_list=$(iwinfo "$iface" assoclist 2>/dev/null | grep dBm | cut -f 1 -s -d" ")
             
-            if [ -n "$mac_list" ]; then
-                for mac in $mac_list; do
-                    mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
-                    local ip=$(ip neigh show | grep -i "$mac" | awk '{print $1}' | head -1)
-                    [ -z "$ip" ] && ip="unknown"
-                    local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "unknown")
-                    all_devices="${all_devices}${dev_obj},"
-                done
-            fi
+            for mac in $mac_list; do
+                mac=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
+                
+                # Корреляция с DHCP leases для получения IP и hostname
+                local ip="unknown"
+                local host="unknown"
+                if [ -f /tmp/dhcp.leases ]; then
+                    local lease=$(grep -i "$mac" /tmp/dhcp.leases 2>/dev/null | head -1)
+                    if [ -n "$lease" ]; then
+                        ip=$(echo "$lease" | cut -f 2 -s -d" ")
+                        host=$(echo "$lease" | cut -f 3 -s -d" ")
+                        [ -z "$ip" ] && ip="unknown"
+                        [ -z "$host" ] && host="unknown"
+                    fi
+                fi
+                
+                local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "$host")
+                all_devices="${all_devices}${dev_obj},"
+            done
         done
     fi
 

@@ -91,6 +91,10 @@ async def post_devices(request):
     
     conn = get_conn()
     now = int(time.time())
+    
+    # Сначала помечаем все устройства этого роутера как оффлайн
+    conn.execute("UPDATE devices SET online=0 WHERE router_id=?", (data["router_id"],))
+    
     saved = 0
     for dev in data["devices"]:
         mac = dev.get("mac", "").lower()

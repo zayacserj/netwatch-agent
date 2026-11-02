@@ -169,7 +169,7 @@ async def callback_confirm_delete(callback: CallbackQuery):
         f"```\n"
         f"ИЛИ просто переподключите роутер:"
     )
-    await callback.message.edit_text(rm_cmd, reply_markup=builder.as_markup())
+    await callback.message.edit_text(rm_cmd, )
     await callback.answer("✅ Роутер удалён")
 
 

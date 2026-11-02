@@ -13,6 +13,16 @@ import sqlite3
 import secrets
 from pathlib import Path
 
+# Загрузка переменных окружения из .env (если есть)
+# Позволяет работать без systemd EnvironmentFile
+ENV_PATH = Path("/opt/netwatch/.env")
+if ENV_PATH.exists():
+    for line in ENV_PATH.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
 from aiohttp import web
 
 from db import (

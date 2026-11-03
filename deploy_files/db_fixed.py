@@ -247,6 +247,14 @@ def set_router_online(router_id, online=True):
     conn.close()
 
 
+def get_user_by_router_id(router_id):
+    """Возвращает chat_id пользователя, которому принадлежит роутер"""
+    conn = get_conn()
+    row = conn.execute("SELECT chat_id FROM routers WHERE router_id=?", (router_id,)).fetchone()
+    conn.close()
+    return row["chat_id"] if row else None
+
+
 # --- devices ---
 
 def get_user_devices(chat_id):

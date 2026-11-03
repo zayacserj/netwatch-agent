@@ -80,14 +80,114 @@ EOF
     cp "$0" /etc/netwatch/agent3.sh
     chmod +x /etc/netwatch/agent3.sh
 
+    # Авто-установка cron
+    cmd_install_cron
+
     # Авто-запуск агента после pair
     log "Авто-запуск агента..."
     # Первый запуск сразу
     /etc/netwatch/agent3.sh run
-    # Крон каждые 2 минуты
-    (crontab -l 2>/dev/null | grep -v agent3.sh; echo "*/2 * * * * /etc/netwatch/agent3.sh run") | crontab -
     /etc/init.d/netwatch-wifi-monitor start 2>/dev/null || true
-    log "Агент установлен и запущен (health-check каждые 2 мин, wifi-monitor)"
+    log "Агент установлен и запущен (snapshot каждую минуту, health-check каждые 5 мин, wifi-monitor)"
+}
+
+# --- snapshot ---
+cmd_snapshot() {
+    local router_id=$(get_router_id)
+    if [ -z "$router_id" ]; then
+        log "Роутер не зарегистрирован. Выполните pair."
+        exit 1
+    fi
+
+    log "Начинаем сбор данных устройств..."
+
+    # Сбор Wi-Fi клиентов
+    local sta_list=$(hostapd_cli all_sta 2>/dev/null)
+    if [ -z "$sta_list" ]; then
+        log "Нет подключённых Wi-Fi клиентов"
+        return
+    fi
+
+    # Парсим MAC-адреса из hostapd_cli all_sta
+    local macs=$(echo "$sta_list" | awk '/^[0-9A-Fa-f:]{17,} / {print $1}')
+
+    local devices_json="[]"
+    local separator=""
+
+    for mac in $macs; do
+        local ip=""
+        local hostname=""
+
+        # Пытаемся получить IP/hostname из /tmp/dhcp.leases
+        if [ -f "/tmp/dhcp.leases" ]; then
+            local lease=$(grep -i "$mac" "/tmp/dhcp.leases" 2>/dev/null | head -1)
+            if [ -n "$lease" ]; then
+                ip=$(echo "$lease" | cut -f 3 -s -d" ")
+                hostname=$(echo "$lease" | cut -f 4 -s -d" ")
+                [ -z "$ip" ] && ip="unknown"
+                [ -z "$hostname" ] && hostname="unknown"
+            fi
+        fi
+
+        # Fallback: ARP table
+        if [ "$ip" = "unknown" ]; then
+            local arp_ip=$(arp -n 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
+            if [ -n "$arp_ip" ]; then
+                ip="$arp_ip"
+            fi
+        fi
+
+        # Формируем устройство JSON
+        local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "$hostname")
+        devices_json=$(echo "$devices_json" | jq --argjson dev "$dev_obj" '. + [$dev]' 2>/dev/null || echo "$devices_json")
+        # fallback если jq нет
+        if [ $? -ne 0 ]; then
+            devices_json=$(echo "$devices_json" | sed "s|]\\$|,$dev_obj\\]|" 2>/dev/null || echo "$devices_json")
+        fi
+    done
+
+    if [ "$devices_json" = "[]" ]; then
+        log "Нет клиентов для отправки"
+        return
+    fi
+
+    local timestamp=$(date +%s)
+    log "Отправляем $devices_json на $PI_URL/devices"
+    local response=$(curl -sS -4 -X POST "$PI_URL/devices" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Secret: $AGENT_SECRET" \
+        -d "{\"router_id\":\"$router_id\",\"devices\":$devices_json,\"timestamp\":$timestamp}")
+
+    echo "Ответ Pi: $response"
+}
+
+# --- install-cron ---
+cmd_install_cron() {
+    log "Установка cron-задач для NetWatch Agent"
+
+    local crontab_content=$(crontab -l 2>/dev/null || echo "")
+
+    # Добавляем задачу snapshot раз в минуту
+    local snapshot_cron="* * * * * $0 snapshot >> /mnt/usb/log/netwatch/snapshot.log 2>&1"
+    if [[ "$crontab_content" != *"$0 snapshot"* ]]; then
+        echo "$crontab_content" | crontab -
+        echo "$snapshot_cron" | crontab -
+        log "Добавлена cron-задача: $snapshot_cron"
+    else
+        log "Cron-задача уже существует, пропускаем"
+    fi
+
+    # Добавляем задачу run каждые 5 минут
+    local run_cron="*/5 * * * * $0 run >> /mnt/usb/log/netwatch/run.log 2>&1"
+    if [[ "$crontab_content" != *"$0 run"* ]]; then
+        echo "$crontab_content" | crontab -
+        echo "$run_cron" | crontab -
+        log "Добавлена cron-задача: $run_cron"
+    else
+        log "Cron-задача run уже существует, пропускаем"
+    fi
+
+    log "Cron-задачи установлены"
 }
 
 # --- run ---
@@ -183,8 +283,8 @@ cmd_run() {
                 if [ -f /tmp/dhcp.leases ]; then
                     local lease=$(grep -i "$mac" /tmp/dhcp.leases 2>/dev/null | head -1)
                     if [ -n "$lease" ]; then
-                        ip=$(echo "$lease" | cut -f 2 -s -d" ")
-                        host=$(echo "$lease" | cut -f 3 -s -d" ")
+                        ip=$(echo "$lease" | cut -f 3 -s -d" ")
+                        host=$(echo "$lease" | cut -f 4 -s -d" ")
                         [ -z "$ip" ] && ip="unknown"
                         [ -z "$host" ] && host="unknown"
                     fi
@@ -282,6 +382,12 @@ case "$1" in
     run)
         cmd_run
         ;;
+    snapshot)
+        cmd_snapshot
+        ;;
+    install-cron)
+        cmd_install_cron
+        ;;
     wifi-monitor)
         cmd_wifi_monitor
         ;;
@@ -293,10 +399,12 @@ case "$1" in
         ;;
     *)
         echo "NetWatch Agent v3 (OpenWrt)"
-        echo "Использование: $0 {pair|run|wifi-monitor|health-check|uninstall}"
+        echo "Использование: $0 {pair|run|snapshot|install-cron|wifi-monitor|health-check|uninstall}"
         echo ""
         echo "  pair          -- Регистрация роутера на Pi + авто-установка агента"
         echo "  run           -- Health-check + heartbeat (cron) + отправка устройств"
+        echo "  snapshot      -- Сбор данных устройств (Wi-Fi клиенты) (cron)"
+        echo "  install-cron  -- Установка cron-задач (snapshot + run)"
         echo "  wifi-monitor  -- Мониторинг Wi-Fi в реальном времени (hostapd_cli)"
         echo "  health-check  -- Проверка здоровья роутера (интернет, Wi-Fi, CPU, RAM, клиенты, Podkop)"
         echo "  uninstall     -- Полное удаление агента с роутера"

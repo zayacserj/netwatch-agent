@@ -94,6 +94,16 @@ def init_db():
         watch_online INTEGER DEFAULT 1,
         FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS device_notifications (
+        chat_id INTEGER,
+        mac TEXT,
+        router_id TEXT,
+        last_notified_at INTEGER DEFAULT (unixepoch()),
+        PRIMARY KEY (chat_id, mac, router_id),
+        FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+        FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+    );
     """)
     conn.commit()
     conn.close()
@@ -105,7 +115,21 @@ def init_db():
         conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
     if "watch_online" not in columns:
         conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
-    conn.commit()
+    # Проверяем наличие таблицы device_notifications
+    tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    if "device_notifications" not in tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_notifications (
+                chat_id INTEGER,
+                mac TEXT,
+                router_id TEXT,
+                last_notified_at INTEGER DEFAULT (unixepoch()),
+                PRIMARY KEY (chat_id, mac, router_id),
+                FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+                FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+            )
+        """)
+        conn.commit()
     conn.close()
 
 
@@ -368,3 +392,30 @@ def is_valid_router_secret(secret):
     ).fetchone()
     conn.close()
     return row is not None
+
+
+def can_notify_device(chat_id, mac, router_id, min_interval=300):
+    """Check if we can send a notification for this device (deduplication)"""
+    conn = get_conn()
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT last_notified_at FROM device_notifications WHERE chat_id=? AND mac=? AND router_id=?",
+        (chat_id, mac, router_id)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return True
+    last_notified_at = row["last_notified_at"]
+    return (now - last_notified_at) >= min_interval
+
+
+def mark_device_notified(chat_id, mac, router_id):
+    """Mark that we've sent a notification for this device"""
+    conn = get_conn()
+    now = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO device_notifications (chat_id, mac, router_id, last_notified_at) VALUES (?, ?, ?, ?)",
+        (chat_id, mac, router_id, now)
+    )
+    conn.commit()
+    conn.close()

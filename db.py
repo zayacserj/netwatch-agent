@@ -96,6 +96,16 @@ def init_db():
         watch_online INTEGER DEFAULT 1,
         FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS device_notifications (
+        chat_id INTEGER,
+        mac TEXT,
+        router_id TEXT,
+        last_notified_at INTEGER DEFAULT (unixepoch()),
+        PRIMARY KEY (chat_id, mac, router_id),
+        FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+        FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+    );
     """)
     conn.commit()
     conn.close()
@@ -107,7 +117,21 @@ def init_db():
         conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
     if "watch_online" not in columns:
         conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
-    conn.commit()
+    # Проверяем наличие таблицы device_notifications
+    tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    if "device_notifications" not in tables:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_notifications (
+                chat_id INTEGER,
+                mac TEXT,
+                router_id TEXT,
+                last_notified_at INTEGER DEFAULT (unixepoch()),
+                PRIMARY KEY (chat_id, mac, router_id),
+                FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+                FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+            )
+        """)
+        conn.commit()
     conn.close()
 
 
@@ -304,6 +328,75 @@ def toggle_device_watch_online(mac, router_id):
         conn.commit()
     conn.close()
     return new_val if row else None
+
+
+def can_notify_device(chat_id, mac, router_id, min_interval=300):
+    conn = get_conn()
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT last_notified_at FROM device_notifications WHERE chat_id=? AND mac=? AND router_id=?",
+        (chat_id, mac, router_id)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return True
+    last_notified_at = row["last_notified_at"]
+    return (now - last_notified_at) >= min_interval
+
+
+def mark_device_notified(chat_id, mac, router_id):
+    conn = get_conn()
+    now = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO device_notifications (chat_id, mac, router_id, last_notified_at) VALUES (?, ?, ?, ?)",
+        (chat_id, mac, router_id, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def upsert_device_with_notification(chat_id, mac, router_id, data):
+    conn = get_conn()
+    now = int(time.time())
+
+    conn.execute("""
+        INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(mac, router_id) DO UPDATE SET
+            ip=excluded.ip,
+            hostname=excluded.hostname,
+            custom_name=excluded.custom_name,
+            online=1,
+            last_seen=excluded.last_seen
+    """, (mac, router_id, data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
+
+    if not can_notify_device(chat_id, mac, router_id):
+        conn.close()
+        return False
+
+    send_notification = True
+    if "online_change" in data:
+        prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?", (mac, router_id)).fetchone()
+        if prev and prev["online"] == 1 and data["online_change"] == 0:
+            pass
+        else:
+            send_notification = False
+
+    if send_notification:
+        send_telegram_notification = False
+        if data.get("event") == "CONNECTED":
+            send_telegram_notification = True
+        elif data.get("event") == "DISCONNECTED":
+            send_telegram_notification = data.get("was_online", 0) == 1
+
+        if send_telegram_notification:
+            chat_id = get_user_by_router_id(router_id)
+            if chat_id:
+                mark_device_notified(chat_id, mac, router_id)
+
+    conn.commit()
+    conn.close()
+    return True
 
 
 # --- events ---

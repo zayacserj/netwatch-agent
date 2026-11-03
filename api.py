@@ -11,6 +11,7 @@ import json
 import time
 import sqlite3
 import secrets
+import asyncio
 from pathlib import Path
 
 # Загрузка переменных окружения из .env (если есть)
@@ -27,7 +28,8 @@ from aiohttp import web
 
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router, get_conn,
-    is_valid_router_secret, get_user_by_router_id
+    is_valid_router_secret, get_user_by_router_id,
+    can_notify_device, mark_device_notified
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
@@ -109,10 +111,12 @@ async def post_event(request):
                 ip=excluded.ip, hostname=excluded.hostname, custom_name=excluded.custom_name
         """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
 
-        # Уведомление о подключении, если был оффлайн
+        # Уведомление о подключении, если был оффлайн (с дедупликацией)
         if chat_id and was_online == 0:
             device_name = data.get("custom_name") or data.get("hostname") or mac
-            send_telegram_notification(chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}")
+            if can_notify_device(chat_id, mac, data["router_id"]):
+                mark_device_notified(chat_id, mac, data["router_id"])
+                send_telegram_notification(chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}")
 
     elif "DISCONNECTED" in event.upper():
         # Проверяем предыдущий статус
@@ -124,12 +128,14 @@ async def post_event(request):
         conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
                      (now, mac, data["router_id"]))
 
-        # Уведомление об отключении, если был онлайн и watch_online включен
+        # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
         if chat_id and was_online == 1 and watch_online == 1:
             device_name = conn.execute("SELECT custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
                                        (mac, data["router_id"])).fetchone()
             name = (device_name["custom_name"] or device_name["hostname"] or mac) if device_name else mac
-            send_telegram_notification(chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}")
+            if can_notify_device(chat_id, mac, data["router_id"]):
+                mark_device_notified(chat_id, mac, data["router_id"])
+                send_telegram_notification(chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}")
     
     conn.commit()
     conn.close()
@@ -148,15 +154,20 @@ async def post_devices(request):
     
     conn = get_conn()
     now = int(time.time())
-    
-    # Сначала помечаем все устройства этого роутера как оффлайн
-    conn.execute("UPDATE devices SET online=0 WHERE router_id=?", (data["router_id"],))
+    chat_id = get_user_by_router_id(data["router_id"])
     
     saved = 0
+    new_devices = []
+    
     for dev in data["devices"]:
         mac = dev.get("mac", "").lower()
         if not mac:
             continue
+        
+        # Check if device is new
+        prev = conn.execute("SELECT mac FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
+        is_new = prev is None
+        
         conn.execute("""
             INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
             VALUES (?, ?, ?, ?, ?, 1, ?, ?)
@@ -168,10 +179,18 @@ async def post_devices(request):
                 last_seen=excluded.last_seen
         """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), dev.get("custom_name"), now, now))
         saved += 1
+        
+        if is_new and chat_id:
+            device_name = dev.get("custom_name") or dev.get("hostname") or mac
+            if can_notify_device(chat_id, mac, data["router_id"]):
+                mark_device_notified(chat_id, mac, data["router_id"])
+                send_telegram_notification(chat_id, f"🆕 Новое устройство: `{mac}` — {device_name}")
+            new_devices.append(mac)
+    
     conn.commit()
     conn.close()
     
-    return web.json_response({"status": "ok", "saved_devices": saved})
+    return web.json_response({"status": "ok", "saved_devices": saved, "new_devices": new_devices})
 
 # --- POST /health ---
 async def post_health(request):
@@ -263,6 +282,46 @@ async def post_pair(request):
         "api_url": "http://" + request.host
     })
 
+# --- Background task: check for offline devices ---
+async def check_offline_devices():
+    """Periodically check for devices with stale last_seen and mark them offline"""
+    while True:
+        try:
+            conn = get_conn()
+            now = int(time.time())
+            threshold = now - 120  # 2 minutes
+            
+            # Find devices that are still marked online but haven't been seen in 2 minutes
+            stale_devices = conn.execute("""
+                SELECT d.mac, d.router_id, d.custom_name, d.hostname, r.chat_id
+                FROM devices d
+                JOIN routers r ON d.router_id = r.router_id
+                WHERE d.online=1 AND d.last_seen < ? AND d.watch_online=1
+            """, (threshold,)).fetchall()
+            
+            for dev in stale_devices:
+                mac = dev["mac"]
+                router_id = dev["router_id"]
+                chat_id = dev["chat_id"]
+                
+                # Mark as offline
+                conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
+                
+                # Send notification if not recently notified
+                if chat_id and can_notify_device(chat_id, mac, router_id):
+                    mark_device_notified(chat_id, mac, router_id)
+                    device_name = dev["custom_name"] or dev["hostname"] or mac
+                    send_telegram_notification(chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}")
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Offline check error: {e}")
+        
+        await asyncio.sleep(60)  # Check every minute
+
+
 # --- App factory ---
 def create_app():
     app = web.Application(middlewares=[auth_middleware])
@@ -271,6 +330,10 @@ def create_app():
     app.router.add_post("/health", post_health)
     app.router.add_get("/agent.sh", get_agent_script)
     app.router.add_post("/pair", post_pair)
+    
+    # Start background task for offline device checking
+    asyncio.create_task(check_offline_devices())
+    
     return app
 
 if __name__ == "__main__":

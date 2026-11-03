@@ -19,7 +19,7 @@ from aiohttp import web
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router, get_conn,
     is_valid_router_secret, get_user_by_router_id,
-    can_notify_device, mark_device_notified
+    can_notify_device, mark_device_notified, init_db
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")

@@ -29,7 +29,7 @@ from aiohttp import web
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router, get_conn,
     is_valid_router_secret, get_user_by_router_id,
-    can_notify_device, mark_device_notified
+    can_notify_device, mark_device_notified, init_db
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
@@ -329,6 +329,9 @@ async def start_offline_check(app):
 
 # --- App factory ---
 def create_app():
+    # Инициализация БД (создание таблиц, миграции)
+    init_db()
+    
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_post("/event", post_event)
     app.router.add_post("/devices", post_devices)

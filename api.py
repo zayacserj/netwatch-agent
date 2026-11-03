@@ -285,6 +285,22 @@ async def post_pair(request):
 # --- Background task: check for offline devices ---
 async def check_offline_devices(app):
     """Periodically check for devices with stale last_seen and mark them offline"""
+    # Ensure device_notifications table exists (init_db might have failed silently)
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS device_notifications (
+            chat_id INTEGER,
+            mac TEXT,
+            router_id TEXT,
+            last_notified_at INTEGER DEFAULT (unixepoch()),
+            PRIMARY KEY (chat_id, mac, router_id),
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
+    conn.close()
+    
     while True:
         try:
             conn = get_conn()

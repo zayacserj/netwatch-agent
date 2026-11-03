@@ -36,13 +36,6 @@ DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
-
 # --- Telegram notification helper ---
 def send_telegram_notification(chat_id, text):
     """Отправляет уведомление в Telegram"""

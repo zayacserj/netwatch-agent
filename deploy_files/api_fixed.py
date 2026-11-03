@@ -14,6 +14,16 @@ import secrets
 import asyncio
 from pathlib import Path
 
+# Загрузка переменных окружения из .env (если есть)
+# Позволяет работать без systemd EnvironmentFile
+ENV_PATH = Path("/opt/netwatch/.env")
+if ENV_PATH.exists():
+    for line in ENV_PATH.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
 from aiohttp import web
 
 from db import (
@@ -26,12 +36,25 @@ DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+# --- Telegram notification helper ---
+def send_telegram_notification(chat_id, text):
+    """Отправляет уведомление в Telegram"""
+    import urllib.request
+    import os as _os
+    import logging
+    logger = logging.getLogger(__name__)
+    token = _os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — notification skipped")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        logger.error(f"Telegram notification failed: {e}")
+
 
 # --- Middleware: проверка X-Agent-Secret ---
 @web.middleware
@@ -254,24 +277,7 @@ async def post_pair(request):
         "api_url": "http://" + request.host
     })
 
-# --- App factory ---
-def create_app():
-    app = web.Application(middlewares=[auth_middleware])
-    app.router.add_post("/event", post_event)
-    app.router.add_post("/devices", post_devices)
-    app.router.add_post("/health", post_health)
-    app.router.add_get("/agent.sh", get_agent_script)
-    app.router.add_post("/pair", post_pair)
-    
-    # Start background task for offline device checking (after event loop starts)
-    app.on_startup.append(start_offline_check)
-    
-    return app
-
-async def start_offline_check(app):
-    """Start background offline checker on app startup"""
-    asyncio.create_task(check_offline_devices(app))
-
+# --- Background task: check for offline devices ---
 async def check_offline_devices(app):
     """Periodically check for devices with stale last_seen and mark them offline"""
     # Ensure device_notifications table exists (init_db might have failed silently)
@@ -325,6 +331,29 @@ async def check_offline_devices(app):
             logging.getLogger(__name__).error(f"Offline check error: {e}")
         
         await asyncio.sleep(60)  # Check every minute
+
+
+async def start_offline_check(app):
+    """Start background offline checker on app startup"""
+    asyncio.create_task(check_offline_devices(app))
+
+
+# --- App factory ---
+def create_app():
+    # Инициализация БД (создание таблиц, миграции)
+    init_db()
+    
+    app = web.Application(middlewares=[auth_middleware])
+    app.router.add_post("/event", post_event)
+    app.router.add_post("/devices", post_devices)
+    app.router.add_post("/health", post_health)
+    app.router.add_get("/agent.sh", get_agent_script)
+    app.router.add_post("/pair", post_pair)
+    
+    # Start background task for offline device checking (after event loop starts)
+    app.on_startup.append(start_offline_check)
+    
+    return app
 
 if __name__ == "__main__":
     web.run_app(create_app(), host="0.0.0.0", port=8080)

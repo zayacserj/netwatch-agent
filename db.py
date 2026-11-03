@@ -13,6 +13,7 @@ def get_conn():
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
@@ -346,6 +347,33 @@ def can_notify_device(chat_id, mac, router_id, min_interval=300):
 
 
 def mark_device_notified(chat_id, mac, router_id):
+    conn = get_conn()
+    now = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO device_notifications (chat_id, mac, router_id, last_notified_at) VALUES (?, ?, ?, ?)",
+        (chat_id, mac, router_id, now)
+    )
+    conn.commit()
+    conn.close()
+
+
+def can_notify_device(chat_id, mac, router_id, min_interval=300):
+    """Check if we can send a notification for this device (deduplication)"""
+    conn = get_conn()
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT last_notified_at FROM device_notifications WHERE chat_id=? AND mac=? AND router_id=?",
+        (chat_id, mac, router_id)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return True
+    last_notified_at = row["last_notified_at"]
+    return (now - last_notified_at) >= min_interval
+
+
+def mark_device_notified(chat_id, mac, router_id):
+    """Mark that we've sent a notification for this device"""
     conn = get_conn()
     now = int(time.time())
     conn.execute(

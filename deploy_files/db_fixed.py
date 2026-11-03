@@ -290,6 +290,81 @@ def set_device_online(mac, router_id, online=True):
     conn.close()
 
 
+def get_device(chat_id, mac, router_id):
+    """Get single device by MAC and router for user"""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT d.*, r.name AS router_name
+        FROM devices d
+        JOIN routers r ON d.router_id = r.router_id
+        WHERE r.chat_id=? AND d.mac=? AND d.router_id=?
+    """, (chat_id, mac.lower(), router_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_device_custom_name(mac, router_id, custom_name):
+    conn = get_conn()
+    conn.execute("UPDATE devices SET custom_name=? WHERE mac=? AND router_id=?", (custom_name, mac.lower(), router_id))
+    conn.commit()
+    conn.close()
+
+
+def toggle_device_watch_online(mac, router_id):
+    conn = get_conn()
+    row = conn.execute("SELECT watch_online FROM devices WHERE mac=? AND router_id=?", (mac.lower(), router_id)).fetchone()
+    if row:
+        new_val = 0 if row["watch_online"] else 1
+        conn.execute("UPDATE devices SET watch_online=? WHERE mac=? AND router_id=?", (new_val, mac.lower(), router_id))
+        conn.commit()
+    conn.close()
+    return new_val if row else None
+
+
+def upsert_device_with_notification(chat_id, mac, router_id, data):
+    conn = get_conn()
+    now = int(time.time())
+
+    conn.execute("""
+        INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(mac, router_id) DO UPDATE SET
+            ip=excluded.ip,
+            hostname=excluded.hostname,
+            custom_name=excluded.custom_name,
+            online=1,
+            last_seen=excluded.last_seen
+    """, (mac, router_id, data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
+
+    if not can_notify_device(chat_id, mac, router_id):
+        conn.close()
+        return False
+
+    send_notification = True
+    if "online_change" in data:
+        prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?", (mac, router_id)).fetchone()
+        if prev and prev["online"] == 1 and data["online_change"] == 0:
+            pass
+        else:
+            send_notification = False
+
+    if send_notification:
+        send_telegram_notification = False
+        if data.get("event") == "CONNECTED":
+            send_telegram_notification = True
+        elif data.get("event") == "DISCONNECTED":
+            send_telegram_notification = data.get("was_online", 0) == 1
+
+        if send_telegram_notification:
+            chat_id = get_user_by_router_id(router_id)
+            if chat_id:
+                mark_device_notified(chat_id, mac, router_id)
+
+    conn.commit()
+    conn.close()
+    return True
+
+
 # --- events ---
 
 def add_event(router_id, mac, event, timestamp=None):

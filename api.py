@@ -297,11 +297,12 @@ async def check_offline_devices(app):
     conn.close()
     
     while True:
+        conn = None
         try:
             conn = get_conn()
             now = int(time.time())
             threshold = now - 120  # 2 minutes
-            
+
             # Find devices that are still marked online but haven't been seen in 2 minutes
             stale_devices = conn.execute("""
                 SELECT d.mac, d.router_id, d.custom_name, d.hostname, r.chat_id
@@ -309,27 +310,29 @@ async def check_offline_devices(app):
                 JOIN routers r ON d.router_id = r.router_id
                 WHERE d.online=1 AND d.last_seen < ? AND d.watch_online=1
             """, (threshold,)).fetchall()
-            
+
             for dev in stale_devices:
                 mac = dev["mac"]
                 router_id = dev["router_id"]
                 chat_id = dev["chat_id"]
-                
+
                 # Mark as offline
                 conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
-                
+
                 # Send notification if not recently notified
                 if chat_id and can_notify_device(chat_id, mac, router_id):
                     mark_device_notified(chat_id, mac, router_id)
                     device_name = dev["custom_name"] or dev["hostname"] or mac
                     send_telegram_notification(chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}")
-            
+
             conn.commit()
-            conn.close()
         except Exception as e:
             import logging
             logging.getLogger(__name__).error(f"Offline check error: {e}")
-        
+        finally:
+            if conn:
+                conn.close()
+
         await asyncio.sleep(60)  # Check every minute
 
 

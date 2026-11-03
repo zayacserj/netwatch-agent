@@ -283,7 +283,7 @@ async def post_pair(request):
     })
 
 # --- Background task: check for offline devices ---
-async def check_offline_devices():
+async def check_offline_devices(app):
     """Periodically check for devices with stale last_seen and mark them offline"""
     while True:
         try:
@@ -322,6 +322,11 @@ async def check_offline_devices():
         await asyncio.sleep(60)  # Check every minute
 
 
+async def start_offline_check(app):
+    """Start background offline checker on app startup"""
+    asyncio.create_task(check_offline_devices(app))
+
+
 # --- App factory ---
 def create_app():
     app = web.Application(middlewares=[auth_middleware])
@@ -331,8 +336,8 @@ def create_app():
     app.router.add_get("/agent.sh", get_agent_script)
     app.router.add_post("/pair", post_pair)
     
-    # Start background task for offline device checking
-    asyncio.create_task(check_offline_devices())
+    # Start background task for offline device checking (after event loop starts)
+    app.on_startup.append(start_offline_check)
     
     return app
 

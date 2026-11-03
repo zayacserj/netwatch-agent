@@ -270,7 +270,7 @@ async def start_offline_check(app):
     """Start background offline checker on app startup"""
     asyncio.create_task(check_offline_devices(app))
 
-async def check_offline_devices():
+async def check_offline_devices(app):
     """Periodically check for devices with stale last_seen and mark them offline"""
     while True:
         try:

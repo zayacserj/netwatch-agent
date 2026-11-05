@@ -57,16 +57,30 @@ def send_telegram_notification(chat_id, text):
 
 
 # --- Middleware: проверка X-Agent-Secret ---
+def get_request_conn(request):
+    """Возвращает одно соединение SQLite на весь запрос."""
+    conn = request.get("_netwatch_db_conn")
+    if conn is None:
+        conn = get_conn()
+        request["_netwatch_db_conn"] = conn
+    return conn
+
+
 @web.middleware
 async def auth_middleware(request, handler):
-    # /agent.sh and /pair don't require authorization
-    if request.path in ("/agent.sh", "/pair") and request.method in ("GET", "POST"):
+    try:
+        # /agent.sh and /pair don't require authorization
+        if request.path in ("/agent.sh", "/pair") and request.method in ("GET", "POST"):
+            return await handler(request)
+
+        secret = request.headers.get("X-Agent-Secret")
+        if not secret or not is_valid_router_secret(secret):
+            return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
         return await handler(request)
-    
-    secret = request.headers.get("X-Agent-Secret")
-    if not secret or not is_valid_router_secret(secret):
-        return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
-    return await handler(request)
+    finally:
+        conn = request.get("_netwatch_db_conn")
+        if conn is not None:
+            conn.close()
 
 # --- POST /event ---
 async def post_event(request):
@@ -79,7 +93,7 @@ async def post_event(request):
     if not all(k in data for k in required):
         return web.json_response({"error": "Missing fields: router_id, mac, event"}, status=400)
     
-    conn = get_conn()
+    conn = get_request_conn(request)
     mac = data["mac"].lower()
     event = data["event"]
     timestamp = data.get("timestamp", int(time.time()))
@@ -88,7 +102,7 @@ async def post_event(request):
                  (data["router_id"], mac, event, timestamp))
     
     # Получаем chat_id пользователя этого роутера
-    chat_id = get_user_by_router_id(data["router_id"])
+    chat_id = get_user_by_router_id(data["router_id"], conn=conn)
     
     # Обновляем состояние устройства
     now = int(time.time())
@@ -109,8 +123,8 @@ async def post_event(request):
         # Уведомление о подключении, если был оффлайн (с дедупликацией)
         if chat_id and was_online == 0:
             device_name = data.get("custom_name") or data.get("hostname") or mac
-            if can_notify_device(chat_id, mac, data["router_id"]):
-                mark_device_notified(chat_id, mac, data["router_id"])
+            if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
+                mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
                 send_telegram_notification(chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}")
 
     elif "DISCONNECTED" in event.upper():
@@ -128,13 +142,11 @@ async def post_event(request):
             device_name = conn.execute("SELECT custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
                                        (mac, data["router_id"])).fetchone()
             name = (device_name["custom_name"] or device_name["hostname"] or mac) if device_name else mac
-            if can_notify_device(chat_id, mac, data["router_id"]):
-                mark_device_notified(chat_id, mac, data["router_id"])
+            if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
+                mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
                 send_telegram_notification(chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}")
     
     conn.commit()
-    conn.close()
-    
     return web.json_response({"status": "ok", "saved": True})
 
 # --- POST /devices ---
@@ -147,9 +159,9 @@ async def post_devices(request):
     if "router_id" not in data or "devices" not in data:
         return web.json_response({"error": "Missing router_id or devices"}, status=400)
     
-    conn = get_conn()
+    conn = get_request_conn(request)
     now = int(time.time())
-    chat_id = get_user_by_router_id(data["router_id"])
+    chat_id = get_user_by_router_id(data["router_id"], conn=conn)
     
     saved = 0
     new_devices = []
@@ -177,14 +189,12 @@ async def post_devices(request):
         
         if is_new and chat_id:
             device_name = dev.get("custom_name") or dev.get("hostname") or mac
-            if can_notify_device(chat_id, mac, data["router_id"]):
-                mark_device_notified(chat_id, mac, data["router_id"])
+            if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
+                mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
                 send_telegram_notification(chat_id, f"🆕 Новое устройство: `{mac}` — {device_name}")
             new_devices.append(mac)
     
     conn.commit()
-    conn.close()
-    
     return web.json_response({"status": "ok", "saved_devices": saved, "new_devices": new_devices})
 
 # --- POST /health ---
@@ -198,7 +208,7 @@ async def post_health(request):
     if not all(k in data for k in required):
         return web.json_response({"error": "Missing health fields"}, status=400)
     
-    conn = get_conn()
+    conn = get_request_conn(request)
     timestamp = data.get("timestamp", int(time.time()))
     conn.execute("""
         INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp)
@@ -209,14 +219,9 @@ async def post_health(request):
           data["cpu"], data["ram"], data["wifi_clients"],
           data["podkop_status"], 1 if data["podkop_test"] else 0,
           timestamp))
-    conn.commit()
-    conn.close()
-    
     # Обновляем last_seen роутера
-    conn = get_conn()
     conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (data["router_id"],))
     conn.commit()
-    conn.close()
     
     return web.json_response({"status": "ok", "saved": True})
 
@@ -282,21 +287,24 @@ async def check_offline_devices(app):
     """Periodically check for devices with stale last_seen and mark them offline"""
     # Ensure device_notifications table exists (init_db might have failed silently)
     conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS device_notifications (
-            chat_id INTEGER,
-            mac TEXT,
-            router_id TEXT,
-            last_notified_at INTEGER DEFAULT (unixepoch()),
-            PRIMARY KEY (chat_id, mac, router_id),
-            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
-            FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_notifications (
+                chat_id INTEGER,
+                mac TEXT,
+                router_id TEXT,
+                last_notified_at INTEGER DEFAULT (unixepoch()),
+                PRIMARY KEY (chat_id, mac, router_id),
+                FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+                FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
     
     while True:
+        conn = None
         try:
             conn = get_conn()
             now = int(time.time())
@@ -319,16 +327,18 @@ async def check_offline_devices(app):
                 conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
                 
                 # Send notification if not recently notified
-                if chat_id and can_notify_device(chat_id, mac, router_id):
-                    mark_device_notified(chat_id, mac, router_id)
+                if chat_id and can_notify_device(chat_id, mac, router_id, conn=conn):
+                    mark_device_notified(chat_id, mac, router_id, conn=conn)
                     device_name = dev["custom_name"] or dev["hostname"] or mac
                     send_telegram_notification(chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}")
             
             conn.commit()
-            conn.close()
         except Exception as e:
             import logging
             logging.getLogger(__name__).error(f"Offline check error: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
         
         await asyncio.sleep(60)  # Check every minute
 

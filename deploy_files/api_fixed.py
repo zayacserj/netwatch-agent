@@ -27,9 +27,9 @@ if ENV_PATH.exists():
 from aiohttp import web
 
 from db import (
-    get_pairing_code, consume_pairing_code, upsert_router, get_conn,
+    get_pairing_code, consume_pairing_code, upsert_router,
     is_valid_router_secret, get_user_by_router_id,
-    can_notify_device, mark_device_notified, init_db
+    can_notify_device, mark_device_notified, init_db, db_session
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
@@ -51,36 +51,23 @@ def send_telegram_notification(chat_id, text):
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = json.dumps({"chat_id": chat_id, "text": text}).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=5)
+        with urllib.request.urlopen(req, timeout=5):
+            pass
     except Exception as e:
         logger.error(f"Telegram notification failed: {e}")
 
 
 # --- Middleware: проверка X-Agent-Secret ---
-def get_request_conn(request):
-    """Возвращает одно соединение SQLite на весь запрос."""
-    conn = request.get("_netwatch_db_conn")
-    if conn is None:
-        conn = get_conn()
-        request["_netwatch_db_conn"] = conn
-    return conn
-
-
 @web.middleware
 async def auth_middleware(request, handler):
-    try:
-        # /agent.sh and /pair don't require authorization
-        if request.path in ("/agent.sh", "/pair") and request.method in ("GET", "POST"):
-            return await handler(request)
-
-        secret = request.headers.get("X-Agent-Secret")
-        if not secret or not is_valid_router_secret(secret):
-            return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
+    # /agent.sh and /pair don't require authorization
+    if request.path in ("/agent.sh", "/pair") and request.method in ("GET", "POST"):
         return await handler(request)
-    finally:
-        conn = request.get("_netwatch_db_conn")
-        if conn is not None:
-            conn.close()
+
+    secret = request.headers.get("X-Agent-Secret")
+    if not secret or not is_valid_router_secret(secret):
+        return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
+    return await handler(request)
 
 # --- POST /event ---
 async def post_event(request):
@@ -88,65 +75,70 @@ async def post_event(request):
         data = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Bad JSON"}, status=400)
-    
+
     required = ["router_id", "mac", "event"]
     if not all(k in data for k in required):
         return web.json_response({"error": "Missing fields: router_id, mac, event"}, status=400)
-    
-    conn = get_request_conn(request)
-    mac = data["mac"].lower()
-    event = data["event"]
-    timestamp = data.get("timestamp", int(time.time()))
-    
-    conn.execute("INSERT INTO events (router_id, mac, event, timestamp) VALUES (?, ?, ?, ?)",
-                 (data["router_id"], mac, event, timestamp))
-    
-    # Получаем chat_id пользователя этого роутера
-    chat_id = get_user_by_router_id(data["router_id"], conn=conn)
-    
-    # Обновляем состояние устройства
-    now = int(time.time())
-    if "CONNECTED" in event.upper():
-        # Проверяем предыдущий статус
-        prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?",
-                            (mac, data["router_id"])).fetchone()
-        was_online = prev["online"] if prev else 0
 
-        conn.execute("""
-            INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(mac, router_id) DO UPDATE SET
-                online=1, last_seen=excluded.last_seen,
-                ip=excluded.ip, hostname=excluded.hostname, custom_name=excluded.custom_name
-        """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
+    notifications = []
+    with db_session() as conn:
+        mac = data["mac"].lower()
+        event = data["event"]
+        timestamp = data.get("timestamp", int(time.time()))
 
-        # Уведомление о подключении, если был оффлайн (с дедупликацией)
-        if chat_id and was_online == 0:
-            device_name = data.get("custom_name") or data.get("hostname") or mac
-            if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
-                mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
-                send_telegram_notification(chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}")
+        conn.execute("INSERT INTO events (router_id, mac, event, timestamp) VALUES (?, ?, ?, ?)",
+                     (data["router_id"], mac, event, timestamp))
 
-    elif "DISCONNECTED" in event.upper():
-        # Проверяем предыдущий статус
-        prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?",
-                            (mac, data["router_id"])).fetchone()
-        was_online = prev["online"] if prev else 0
-        watch_online = prev["watch_online"] if prev else 1
+        # Получаем chat_id пользователя этого роутера
+        chat_id = get_user_by_router_id(data["router_id"], conn=conn)
 
-        conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
-                     (now, mac, data["router_id"]))
+        # Обновляем состояние устройства
+        now = int(time.time())
+        event_upper = event.upper()
+        # DISCONNECTED also contains CONNECTED; exclude it from this branch.
+        if "CONNECTED" in event_upper and "DISCONNECTED" not in event_upper:
+            # Проверяем предыдущий статус
+            prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?",
+                                (mac, data["router_id"])).fetchone()
+            was_online = prev["online"] if prev else 0
 
-        # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
-        if chat_id and was_online == 1 and watch_online == 1:
-            device_name = conn.execute("SELECT custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
-                                       (mac, data["router_id"])).fetchone()
-            name = (device_name["custom_name"] or device_name["hostname"] or mac) if device_name else mac
-            if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
-                mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
-                send_telegram_notification(chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}")
-    
-    conn.commit()
+            conn.execute("""
+                INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(mac, router_id) DO UPDATE SET
+                    online=1, last_seen=excluded.last_seen,
+                    ip=excluded.ip, hostname=excluded.hostname, custom_name=excluded.custom_name
+            """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
+
+            # Уведомление о подключении, если был оффлайн (с дедупликацией)
+            if chat_id and was_online == 0:
+                device_name = data.get("custom_name") or data.get("hostname") or mac
+                if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
+                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
+                    notifications.append((chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}"))
+
+        elif "DISCONNECTED" in event_upper:
+            # Проверяем предыдущий статус
+            prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?",
+                                (mac, data["router_id"])).fetchone()
+            was_online = prev["online"] if prev else 0
+            watch_online = prev["watch_online"] if prev else 1
+
+            conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
+                         (now, mac, data["router_id"]))
+
+            # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
+            if chat_id and was_online == 1 and watch_online == 1:
+                device_name = conn.execute("SELECT custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
+                                           (mac, data["router_id"])).fetchone()
+                name = (device_name["custom_name"] or device_name["hostname"] or mac) if device_name else mac
+                if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
+                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
+                    notifications.append((chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}"))
+
+    for chat_id, text in notifications:
+        send_telegram_notification(chat_id, text)
+
     return web.json_response({"status": "ok", "saved": True})
 
 # --- POST /devices ---
@@ -155,46 +147,49 @@ async def post_devices(request):
         data = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Bad JSON"}, status=400)
-    
+
     if "router_id" not in data or "devices" not in data:
         return web.json_response({"error": "Missing router_id or devices"}, status=400)
-    
-    conn = get_request_conn(request)
-    now = int(time.time())
-    chat_id = get_user_by_router_id(data["router_id"], conn=conn)
-    
-    saved = 0
-    new_devices = []
-    
-    for dev in data["devices"]:
-        mac = dev.get("mac", "").lower()
-        if not mac:
-            continue
-        
-        # Check if device is new
-        prev = conn.execute("SELECT mac FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
-        is_new = prev is None
-        
-        conn.execute("""
-            INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(mac, router_id) DO UPDATE SET
-                ip=excluded.ip,
-                hostname=excluded.hostname,
-                custom_name=excluded.custom_name,
-                online=1,
-                last_seen=excluded.last_seen
-        """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), dev.get("custom_name"), now, now))
-        saved += 1
-        
-        if is_new and chat_id:
-            device_name = dev.get("custom_name") or dev.get("hostname") or mac
-            if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
-                mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
-                send_telegram_notification(chat_id, f"🆕 Новое устройство: `{mac}` — {device_name}")
-            new_devices.append(mac)
-    
-    conn.commit()
+
+    notifications = []
+    with db_session() as conn:
+        now = int(time.time())
+        chat_id = get_user_by_router_id(data["router_id"], conn=conn)
+
+        saved = 0
+        new_devices = []
+
+        for dev in data["devices"]:
+            mac = dev.get("mac", "").lower()
+            if not mac:
+                continue
+
+            # Check if device is new
+            prev = conn.execute("SELECT mac FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
+            is_new = prev is None
+
+            conn.execute("""
+                INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(mac, router_id) DO UPDATE SET
+                    ip=excluded.ip,
+                    hostname=excluded.hostname,
+                    custom_name=excluded.custom_name,
+                    online=1,
+                    last_seen=excluded.last_seen
+            """, (mac, data["router_id"], dev.get("ip"), dev.get("hostname"), dev.get("custom_name"), now, now))
+            saved += 1
+
+            if is_new and chat_id:
+                device_name = dev.get("custom_name") or dev.get("hostname") or mac
+                if can_notify_device(chat_id, mac, data["router_id"], conn=conn):
+                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn)
+                    notifications.append((chat_id, f"🆕 Новое устройство: `{mac}` — {device_name}"))
+                new_devices.append(mac)
+
+    for chat_id, text in notifications:
+        send_telegram_notification(chat_id, text)
+
     return web.json_response({"status": "ok", "saved_devices": saved, "new_devices": new_devices})
 
 # --- POST /health ---
@@ -203,26 +198,26 @@ async def post_health(request):
         data = await request.json()
     except json.JSONDecodeError:
         return web.json_response({"error": "Bad JSON"}, status=400)
-    
+
     required = ["router_id", "internet", "wifi", "cpu", "ram", "wifi_clients", "podkop_status", "podkop_test"]
     if not all(k in data for k in required):
         return web.json_response({"error": "Missing health fields"}, status=400)
-    
-    conn = get_request_conn(request)
-    timestamp = data.get("timestamp", int(time.time()))
-    conn.execute("""
-        INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (data["router_id"], 
-          1 if data["internet"] else 0,
-          1 if data["wifi"] else 0,
-          data["cpu"], data["ram"], data["wifi_clients"],
-          data["podkop_status"], 1 if data["podkop_test"] else 0,
-          timestamp))
-    # Обновляем last_seen роутера
-    conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (data["router_id"],))
-    conn.commit()
-    
+
+    with db_session() as conn:
+        timestamp = data.get("timestamp", int(time.time()))
+        conn.execute("""
+            INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (data["router_id"],
+              1 if data["internet"] else 0,
+              1 if data["wifi"] else 0,
+              data["cpu"], data["ram"], data["wifi_clients"],
+              data["podkop_status"], 1 if data["podkop_test"] else 0,
+              timestamp))
+
+        # Обновляем last_seen роутера
+        conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (data["router_id"],))
+
     return web.json_response({"status": "ok", "saved": True})
 
 # --- GET /agent.sh ---
@@ -261,19 +256,17 @@ async def post_pair(request):
     router_secret = secrets.token_hex(16)
 
     # Сохраняем секрет в конфиге (для последующих запросов)
-    conn = get_conn()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS router_secrets (
-            router_id TEXT PRIMARY KEY,
-            secret TEXT NOT NULL,
-            FOREIGN KEY (router_id) REFERENCES routers(router_id)
-        )
-    """)
-    conn.execute("""
-        INSERT OR REPLACE INTO router_secrets (router_id, secret) VALUES (?, ?)
-    """, (router_id, router_secret))
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS router_secrets (
+                router_id TEXT PRIMARY KEY,
+                secret TEXT NOT NULL,
+                FOREIGN KEY (router_id) REFERENCES routers(router_id)
+            )
+        """)
+        conn.execute("""
+            INSERT OR REPLACE INTO router_secrets (router_id, secret) VALUES (?, ?)
+        """, (router_id, router_secret))
 
     return web.json_response({
         "status": "paired",
@@ -286,8 +279,7 @@ async def post_pair(request):
 async def check_offline_devices(app):
     """Periodically check for devices with stale last_seen and mark them offline"""
     # Ensure device_notifications table exists (init_db might have failed silently)
-    conn = get_conn()
-    try:
+    with db_session() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS device_notifications (
                 chat_id INTEGER,
@@ -299,47 +291,42 @@ async def check_offline_devices(app):
                 FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
             )
         """)
-        conn.commit()
-    finally:
-        conn.close()
-    
+
     while True:
-        conn = None
         try:
-            conn = get_conn()
-            now = int(time.time())
-            threshold = now - 120  # 2 minutes
-            
-            # Find devices that are still marked online but haven't been seen in 2 minutes
-            stale_devices = conn.execute("""
-                SELECT d.mac, d.router_id, d.custom_name, d.hostname, r.chat_id
-                FROM devices d
-                JOIN routers r ON d.router_id = r.router_id
-                WHERE d.online=1 AND d.last_seen < ? AND d.watch_online=1
-            """, (threshold,)).fetchall()
-            
-            for dev in stale_devices:
-                mac = dev["mac"]
-                router_id = dev["router_id"]
-                chat_id = dev["chat_id"]
-                
-                # Mark as offline
-                conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
-                
-                # Send notification if not recently notified
-                if chat_id and can_notify_device(chat_id, mac, router_id, conn=conn):
-                    mark_device_notified(chat_id, mac, router_id, conn=conn)
-                    device_name = dev["custom_name"] or dev["hostname"] or mac
-                    send_telegram_notification(chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}")
-            
-            conn.commit()
+            notifications = []
+            with db_session() as conn:
+                now = int(time.time())
+                threshold = now - 120  # 2 minutes
+
+                # Find devices that are still marked online but haven't been seen in 2 minutes
+                stale_devices = conn.execute("""
+                    SELECT d.mac, d.router_id, d.custom_name, d.hostname, r.chat_id
+                    FROM devices d
+                    JOIN routers r ON d.router_id = r.router_id
+                    WHERE d.online=1 AND d.last_seen < ? AND d.watch_online=1
+                """, (threshold,)).fetchall()
+
+                for dev in stale_devices:
+                    mac = dev["mac"]
+                    router_id = dev["router_id"]
+                    chat_id = dev["chat_id"]
+
+                    # Mark as offline
+                    conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
+
+                    # Send notification if not recently notified
+                    if chat_id and can_notify_device(chat_id, mac, router_id, conn=conn):
+                        mark_device_notified(chat_id, mac, router_id, conn=conn)
+                        device_name = dev["custom_name"] or dev["hostname"] or mac
+                        notifications.append((chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}"))
+
+            for chat_id, text in notifications:
+                send_telegram_notification(chat_id, text)
         except Exception as e:
             import logging
             logging.getLogger(__name__).error(f"Offline check error: {e}")
-        finally:
-            if conn is not None:
-                conn.close()
-        
+
         await asyncio.sleep(60)  # Check every minute
 
 
@@ -352,17 +339,17 @@ async def start_offline_check(app):
 def create_app():
     # Инициализация БД (создание таблиц, миграции)
     init_db()
-    
+
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_post("/event", post_event)
     app.router.add_post("/devices", post_devices)
     app.router.add_post("/health", post_health)
     app.router.add_get("/agent.sh", get_agent_script)
     app.router.add_post("/pair", post_pair)
-    
+
     # Start background task for offline device checking (after event loop starts)
     app.on_startup.append(start_offline_check)
-    
+
     return app
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 NetWatch database layer (sqlite3)
 """
 import sqlite3
+from contextlib import contextmanager
 import os
 import time
 from pathlib import Path
@@ -11,128 +12,147 @@ DB_PATH = Path(os.getenv("NETWATCH_DB_PATH", "/opt/netwatch/netwatch.db"))
 
 def get_conn():
     conn = sqlite3.connect(str(DB_PATH), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
+@contextmanager
+def db_session(conn=None):
+    """Commit/rollback and close only connections owned by this scope."""
+    owned = conn is None
+    if owned:
+        conn = get_conn()
+    try:
+        yield conn
+        if owned:
+            conn.commit()
+    except BaseException:
+        if owned:
+            conn.rollback()
+        raise
+    finally:
+        if owned:
+            conn.close()
 
 
 def init_db():
-    conn = get_conn()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        chat_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        is_admin INTEGER DEFAULT 0,
-        created_at INTEGER DEFAULT (unixepoch())
-    );
+    with db_session() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            is_admin INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (unixepoch())
+        );
 
-    CREATE TABLE IF NOT EXISTS routers (
-        router_id TEXT PRIMARY KEY,
-        chat_id INTEGER NOT NULL,
-        name TEXT,
-        mac TEXT,
-        model TEXT,
-        online INTEGER DEFAULT 0,
-        last_seen INTEGER DEFAULT (unixepoch()),
-        created_at INTEGER DEFAULT (unixepoch()),
-        FOREIGN KEY (chat_id) REFERENCES users(chat_id)
-    );
+        CREATE TABLE IF NOT EXISTS routers (
+            router_id TEXT PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            name TEXT,
+            mac TEXT,
+            model TEXT,
+            online INTEGER DEFAULT 0,
+            last_seen INTEGER DEFAULT (unixepoch()),
+            created_at INTEGER DEFAULT (unixepoch()),
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+        );
 
-    CREATE TABLE IF NOT EXISTS devices (
-        mac TEXT,
-        router_id TEXT,
-        ip TEXT,
-        hostname TEXT,
-        online INTEGER DEFAULT 0,
-        first_seen INTEGER DEFAULT (unixepoch()),
-        last_seen INTEGER DEFAULT (unixepoch()),
-        PRIMARY KEY (mac, router_id),
-        FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
-    );
+        CREATE TABLE IF NOT EXISTS devices (
+            mac TEXT,
+            router_id TEXT,
+            ip TEXT,
+            hostname TEXT,
+            online INTEGER DEFAULT 0,
+            first_seen INTEGER DEFAULT (unixepoch()),
+            last_seen INTEGER DEFAULT (unixepoch()),
+            PRIMARY KEY (mac, router_id),
+            FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
+        );
 
-    CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        router_id TEXT,
-        mac TEXT,
-        event TEXT,
-        timestamp INTEGER DEFAULT (unixepoch()),
-        FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
-    );
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            router_id TEXT,
+            mac TEXT,
+            event TEXT,
+            timestamp INTEGER DEFAULT (unixepoch()),
+            FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
+        );
 
-    CREATE TABLE IF NOT EXISTS health_checks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        router_id TEXT,
-        internet INTEGER,
-        wifi INTEGER,
-        cpu TEXT,
-        ram TEXT,
-        wifi_clients INTEGER,
-        podkop_status TEXT,
-        podkop_test INTEGER,
-        timestamp INTEGER DEFAULT (unixepoch()),
-        FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
-    );
+        CREATE TABLE IF NOT EXISTS health_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            router_id TEXT,
+            internet INTEGER,
+            wifi INTEGER,
+            cpu TEXT,
+            ram TEXT,
+            wifi_clients INTEGER,
+            podkop_status TEXT,
+            podkop_test INTEGER,
+            timestamp INTEGER DEFAULT (unixepoch()),
+            FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
+        );
 
-    CREATE TABLE IF NOT EXISTS pairing_codes (
-        code TEXT PRIMARY KEY,
-        chat_id INTEGER,
-        router_id TEXT,
-        expires_at INTEGER,
-        used INTEGER DEFAULT 0,
-        created_at INTEGER DEFAULT (unixepoch())
-    );
+        CREATE TABLE IF NOT EXISTS pairing_codes (
+            code TEXT PRIMARY KEY,
+            chat_id INTEGER,
+            router_id TEXT,
+            expires_at INTEGER,
+            used INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (unixepoch())
+        );
 
-    CREATE TABLE IF NOT EXISTS router_secrets (
-        router_id TEXT PRIMARY KEY,
-        secret TEXT NOT NULL,
-        FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
-    );
+        CREATE TABLE IF NOT EXISTS router_secrets (
+            router_id TEXT PRIMARY KEY,
+            secret TEXT NOT NULL,
+            FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
+        );
 
-    CREATE TABLE IF NOT EXISTS user_settings (
-        chat_id INTEGER PRIMARY KEY,
-        watch_online INTEGER DEFAULT 1,
-        FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
-    );
+        CREATE TABLE IF NOT EXISTS user_settings (
+            chat_id INTEGER PRIMARY KEY,
+            watch_online INTEGER DEFAULT 1,
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+        );
 
-    CREATE TABLE IF NOT EXISTS device_notifications (
-        chat_id INTEGER,
-        mac TEXT,
-        router_id TEXT,
-        last_notified_at INTEGER DEFAULT (unixepoch()),
-        PRIMARY KEY (chat_id, mac, router_id),
-        FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
-        FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
-    );
-    """)
-    conn.commit()
-    conn.close()
+        CREATE TABLE IF NOT EXISTS device_notifications (
+            chat_id INTEGER,
+            mac TEXT,
+            router_id TEXT,
+            last_notified_at INTEGER DEFAULT (unixepoch()),
+            PRIMARY KEY (chat_id, mac, router_id),
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+        );
+        """)
 
     # Миграция: добавить новые колонки если таблица уже существует
-    conn = get_conn()
-    columns = [col["name"] for col in conn.execute("PRAGMA table_info(devices)").fetchall()]
-    if "custom_name" not in columns:
-        conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
-    if "watch_online" not in columns:
-        conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
-    # Проверяем наличие таблицы device_notifications
-    tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-    if "device_notifications" not in tables:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS device_notifications (
-                chat_id INTEGER,
-                mac TEXT,
-                router_id TEXT,
-                last_notified_at INTEGER DEFAULT (unixepoch()),
-                PRIMARY KEY (chat_id, mac, router_id),
-                FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
-                FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
-            )
-        """)
-        conn.commit()
-    conn.close()
+    with db_session() as conn:
+        columns = [col["name"] for col in conn.execute("PRAGMA table_info(devices)").fetchall()]
+        if "custom_name" not in columns:
+            conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
+        if "watch_online" not in columns:
+            conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
+        # Проверяем наличие таблицы device_notifications
+        tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "device_notifications" not in tables:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS device_notifications (
+                    chat_id INTEGER,
+                    mac TEXT,
+                    router_id TEXT,
+                    last_notified_at INTEGER DEFAULT (unixepoch()),
+                    PRIMARY KEY (chat_id, mac, router_id),
+                    FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+                    FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
+                )
+            """)
 
 
 # --- users ---
@@ -192,40 +212,36 @@ def clean_user_data(chat_id):
 # --- routers ---
 
 def upsert_router(router_id, chat_id, name=None, mac=None, model=None):
-    conn = get_conn()
-    
-    # Если есть MAC — проверить, есть ли уже роутер с таким MAC
-    if mac:
-        existing = conn.execute(
-            "SELECT router_id FROM routers WHERE mac=? AND chat_id=?", 
-            (mac.lower(), chat_id)
-        ).fetchone()
-        if existing:
-            router_id = existing["router_id"]
-            # Обновить имя/модель
-            conn.execute("""
-                UPDATE routers SET 
-                    name=COALESCE(?, name),
-                    model=COALESCE(?, model),
-                    last_seen=unixepoch()
-                WHERE router_id=?
-            """, (name, model, router_id))
-            conn.commit()
-            conn.close()
-            return router_id
-    
-    # Иначе создать новый
-    conn.execute("""
-        INSERT INTO routers (router_id, chat_id, name, mac, model, online, last_seen)
-        VALUES (?, ?, ?, ?, ?, 0, unixepoch())
-        ON CONFLICT(router_id) DO UPDATE SET
-            name=COALESCE(excluded.name, routers.name),
-            mac=COALESCE(excluded.mac, routers.mac),
-            model=COALESCE(excluded.model, routers.model)
-    """, (router_id, chat_id, name, mac, model))
-    conn.commit()
-    conn.close()
-    return router_id
+    with db_session() as conn:
+
+        # Если есть MAC — проверить, есть ли уже роутер с таким MAC
+        if mac:
+            existing = conn.execute(
+                "SELECT router_id FROM routers WHERE mac=? AND chat_id=?",
+                (mac.lower(), chat_id)
+            ).fetchone()
+            if existing:
+                router_id = existing["router_id"]
+                # Обновить имя/модель
+                conn.execute("""
+                    UPDATE routers SET
+                        name=COALESCE(?, name),
+                        model=COALESCE(?, model),
+                        last_seen=unixepoch()
+                    WHERE router_id=?
+                """, (name, model, router_id))
+                return router_id
+
+        # Иначе создать новый
+        conn.execute("""
+            INSERT INTO routers (router_id, chat_id, name, mac, model, online, last_seen)
+            VALUES (?, ?, ?, ?, ?, 0, unixepoch())
+            ON CONFLICT(router_id) DO UPDATE SET
+                name=COALESCE(excluded.name, routers.name),
+                mac=COALESCE(excluded.mac, routers.mac),
+                model=COALESCE(excluded.model, routers.model)
+        """, (router_id, chat_id, name, mac, model))
+        return router_id
 
 
 def get_user_routers(chat_id):
@@ -251,15 +267,9 @@ def set_router_online(router_id, online=True):
 
 def get_user_by_router_id(router_id, conn=None):
     """Возвращает chat_id пользователя, которому принадлежит роутер"""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = get_conn()
-    try:
+    with db_session(conn) as conn:
         row = conn.execute("SELECT chat_id FROM routers WHERE router_id=?", (router_id,)).fetchone()
-    finally:
-        if owns_conn:
-            conn.close()
-    return row["chat_id"] if row else None
+        return row["chat_id"] if row else None
 
 
 # --- devices ---
@@ -327,8 +337,7 @@ def toggle_device_watch_online(mac, router_id):
 
 
 def upsert_device_with_notification(chat_id, mac, router_id, data):
-    conn = get_conn()
-    try:
+    with db_session() as conn:
         now = int(time.time())
 
         conn.execute("""
@@ -342,33 +351,29 @@ def upsert_device_with_notification(chat_id, mac, router_id, data):
                 last_seen=excluded.last_seen
         """, (mac, router_id, data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
 
-        if not can_notify_device(chat_id, mac, router_id, conn=conn):
-            return False
+        can_notify = can_notify_device(chat_id, mac, router_id, conn=conn)
+        if can_notify:
+            send_notification = True
+            if "online_change" in data:
+                prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?", (mac, router_id)).fetchone()
+                if prev and prev["online"] == 1 and data["online_change"] == 0:
+                    pass
+                else:
+                    send_notification = False
 
-        send_notification = True
-        if "online_change" in data:
-            prev = conn.execute("SELECT online FROM devices WHERE mac=? AND router_id=?", (mac, router_id)).fetchone()
-            if prev and prev["online"] == 1 and data["online_change"] == 0:
-                pass
-            else:
-                send_notification = False
+            if send_notification:
+                send_telegram_notification = False
+                if data.get("event") == "CONNECTED":
+                    send_telegram_notification = True
+                elif data.get("event") == "DISCONNECTED":
+                    send_telegram_notification = data.get("was_online", 0) == 1
 
-        if send_notification:
-            send_telegram_notification = False
-            if data.get("event") == "CONNECTED":
-                send_telegram_notification = True
-            elif data.get("event") == "DISCONNECTED":
-                send_telegram_notification = data.get("was_online", 0) == 1
+                if send_telegram_notification:
+                    chat_id = get_user_by_router_id(router_id, conn=conn)
+                    if chat_id:
+                        mark_device_notified(chat_id, mac, router_id, conn=conn)
 
-            if send_telegram_notification:
-                chat_id = get_user_by_router_id(router_id, conn=conn)
-                if chat_id:
-                    mark_device_notified(chat_id, mac, router_id, conn=conn)
-
-        conn.commit()
-        return True
-    finally:
-        conn.close()
+    return can_notify
 
 
 # --- events ---
@@ -446,20 +451,17 @@ def create_pairing_code(code, chat_id, expires_sec=900):
 
 
 def get_pairing_code(code):
-    conn = get_conn()
-    row = conn.execute("""
-        SELECT * FROM pairing_codes
-        WHERE code=? AND used=0 AND expires_at > ?
-    """, (code, int(time.time()))).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    with db_session() as conn:
+        row = conn.execute("""
+            SELECT * FROM pairing_codes
+            WHERE code=? AND used=0 AND expires_at > ?
+        """, (code, int(time.time()))).fetchone()
+        return dict(row) if row else None
 
 
 def consume_pairing_code(code, router_id):
-    conn = get_conn()
-    conn.execute("UPDATE pairing_codes SET used=1, router_id=? WHERE code=?", (router_id, code))
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        conn.execute("UPDATE pairing_codes SET used=1, router_id=? WHERE code=?", (router_id, code))
 
 
 # --- cascade delete ---
@@ -476,48 +478,33 @@ def delete_router_complete(router_id):
 
 def is_valid_router_secret(secret):
     """Check if a secret is valid (exists in router_secrets table)"""
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT router_id FROM router_secrets WHERE secret=?", 
-        (secret,)
-    ).fetchone()
-    conn.close()
-    return row is not None
+    with db_session() as conn:
+        row = conn.execute(
+            "SELECT router_id FROM router_secrets WHERE secret=?",
+            (secret,)
+        ).fetchone()
+        return row is not None
 
 
 def can_notify_device(chat_id, mac, router_id, min_interval=300, conn=None):
     """Check if we can send a notification for this device (deduplication)"""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = get_conn()
-    try:
+    with db_session(conn) as conn:
         now = int(time.time())
         row = conn.execute(
             "SELECT last_notified_at FROM device_notifications WHERE chat_id=? AND mac=? AND router_id=?",
             (chat_id, mac, router_id)
         ).fetchone()
-    finally:
-        if owns_conn:
-            conn.close()
-    if not row:
-        return True
-    last_notified_at = row["last_notified_at"]
-    return (now - last_notified_at) >= min_interval
+        if not row:
+            return True
+        last_notified_at = row["last_notified_at"]
+        return (now - last_notified_at) >= min_interval
 
 
 def mark_device_notified(chat_id, mac, router_id, conn=None):
     """Mark that we've sent a notification for this device"""
-    owns_conn = conn is None
-    if owns_conn:
-        conn = get_conn()
-    try:
+    with db_session(conn) as conn:
         now = int(time.time())
         conn.execute(
             "INSERT OR REPLACE INTO device_notifications (chat_id, mac, router_id, last_notified_at) VALUES (?, ?, ?, ?)",
             (chat_id, mac, router_id, now)
         )
-        if owns_conn:
-            conn.commit()
-    finally:
-        if owns_conn:
-            conn.close()

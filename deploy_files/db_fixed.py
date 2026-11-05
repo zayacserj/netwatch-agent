@@ -274,15 +274,20 @@ def get_user_by_router_id(router_id, conn=None):
 
 # --- devices ---
 
-def get_user_devices(chat_id):
+def get_user_devices(chat_id, router_id=None):
     conn = get_conn()
-    rows = conn.execute("""
+    query = """
         SELECT d.*, r.name AS router_name, r.router_id
         FROM devices d
         JOIN routers r ON d.router_id = r.router_id
         WHERE r.chat_id=?
-        ORDER BY d.last_seen DESC
-    """, (chat_id,)).fetchall()
+    """
+    params = (chat_id,)
+    if router_id:
+        query += " AND d.router_id=?"
+        params += (router_id,)
+    query += " ORDER BY d.last_seen DESC"
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

@@ -93,72 +93,62 @@ EOF
 
 # --- snapshot ---
 cmd_snapshot() {
-    local router_id=$(get_router_id)
+    local router_id
+    router_id=$(get_router_id)
     if [ -z "$router_id" ]; then
-        log "Роутер не зарегистрирован. Выполните pair."
-        exit 1
+        log "Router is not paired"
+        return 1
     fi
 
-    log "Начинаем сбор данных устройств..."
-
-    # Сбор Wi-Fi клиентов
-    local sta_list=$(hostapd_cli all_sta 2>/dev/null)
-    if [ -z "$sta_list" ]; then
-        log "Нет подключённых Wi-Fi клиентов"
-        return
-    fi
-
-    # Парсим MAC-адреса из hostapd_cli all_sta
-    local macs=$(echo "$sta_list" | awk '/^[0-9A-Fa-f:]{17,} / {print $1}')
-
-    local devices_json="[]"
-    local separator=""
-
-    for mac in $macs; do
-        local ip=""
-        local hostname=""
-
-        # Пытаемся получить IP/hostname из /tmp/dhcp.leases
-        if [ -f "/tmp/dhcp.leases" ]; then
-            local lease=$(grep -i "$mac" "/tmp/dhcp.leases" 2>/dev/null | head -1)
-            if [ -n "$lease" ]; then
-                ip=$(echo "$lease" | cut -f 3 -s -d" ")
-                hostname=$(echo "$lease" | cut -f 4 -s -d" ")
-                [ -z "$ip" ] && ip="unknown"
-                [ -z "$hostname" ] && hostname="unknown"
-            fi
-        fi
-
-        # Fallback: ARP table
-        if [ "$ip" = "unknown" ]; then
-            local arp_ip=$(arp -n 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
-            if [ -n "$arp_ip" ]; then
-                ip="$arp_ip"
-            fi
-        fi
-
-        # Формируем устройство JSON
-        local dev_obj=$(printf '{"mac":"%s","ip":"%s","hostname":"%s"}' "$mac" "$ip" "$hostname")
-        devices_json=$(echo "$devices_json" | jq --argjson dev "$dev_obj" '. + [$dev]' 2>/dev/null || echo "$devices_json")
-        # fallback если jq нет
-        if [ $? -ne 0 ]; then
-            devices_json=$(echo "$devices_json" | sed "s|]\\$|,$dev_obj\\]|" 2>/dev/null || echo "$devices_json")
+    local tool
+    for tool in iw iwinfo jq curl; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            log "Missing snapshot dependency: $tool"
+            return 1
         fi
     done
 
-    if [ "$devices_json" = "[]" ]; then
-        log "Нет клиентов для отправки"
-        return
+    local wireless interfaces iface assoc macs mac ip hostname
+    local devices_json='[]' payload
+    wireless=$(iw dev) || return 1
+    interfaces=$(printf '%s\n' "$wireless" | awk '$1 == "Interface" {print $2}')
+    if [ -z "$interfaces" ]; then
+        log "No Wi-Fi interfaces found"
+        return 1
     fi
 
-    local timestamp=$(date +%s)
-    log "Отправляем $devices_json на $PI_URL/devices"
-    local response=$(curl -sS -4 -X POST "$PI_URL/devices" \
-        -H "Content-Type: application/json" \
-        -H "X-Agent-Secret: $AGENT_SECRET" \
-        -d "{\"router_id\":\"$router_id\",\"devices\":$devices_json,\"timestamp\":$timestamp}")
+    for iface in $interfaces; do
+        assoc=$(iwinfo "$iface" assoclist) || return 1
+        macs=$(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')
+        for mac in $macs; do
+            ip='unknown'
+            hostname='unknown'
+            if [ -f /tmp/dhcp.leases ]; then
+                ip=$(awk -v mac="$mac" 'tolower($2) == mac {print $3; exit}' /tmp/dhcp.leases)
+                hostname=$(awk -v mac="$mac" 'tolower($2) == mac {print $4; exit}' /tmp/dhcp.leases)
+            fi
+            if [ -z "$ip" ] || [ "$ip" = 'unknown' ]; then
+                ip=$(ip neigh 2>/dev/null | awk -v mac="$mac" 'tolower($5) == mac {print $1; exit}')
+            fi
+            [ -n "$ip" ] || ip='unknown'
+            if [ -z "$hostname" ] || [ "$hostname" = '*' ]; then
+                hostname='unknown'
+            fi
+            devices_json=$(printf '%s' "$devices_json" |
+                jq -c --arg mac "$mac" --arg ip "$ip" --arg hostname "$hostname" \
+                '. + [{mac:$mac, ip:$ip, hostname:$hostname}] | unique_by(.mac)') || return 1
+        done
+    done
 
-    echo "Ответ Pi: $response"
+    payload=$(jq -cn --arg router_id "$router_id" \
+        --argjson devices "$devices_json" --argjson timestamp "$(date +%s)" \
+        '{router_id:$router_id, devices:$devices, timestamp:$timestamp}') || return 1
+
+    # Keep the secret out of process arguments; report HTTP/transport failures.
+    printf 'X-Agent-Secret: %s\n' "$AGENT_SECRET" |
+        curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+        --header @- --header 'Content-Type: application/json' \
+        --data-binary "$payload" "${PI_URL%/}/devices"
 }
 
 # --- install-cron ---

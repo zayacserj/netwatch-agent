@@ -204,33 +204,64 @@ cmd_run() {
         internet=0
     fi
 
-    # Проверка Wi-Fi (hostapd_cli) — проверяем все Wi-Fi интерфейсы
-    local wifi_interface_found=0
-    local wifi_clients_total=0
-    if command -v iwinfo > /dev/null 2>&1; then
-        local iface_list=$(iwinfo 2>/dev/null | grep ESSID | cut -f 1 -s -d" ")
-        for iface in $iface_list; do
-            if hostapd_cli -i "$iface" status > /dev/null 2>&1; then
-                wifi_interface_found=1
-                local iface_clients=$(hostapd_cli -i "$iface" all_sta 2>/dev/null | grep -c "SSID=" || echo 0)
-                wifi_clients_total=$((wifi_clients_total + iface_clients))
-            fi
-        done
-    fi
-    if [ "$wifi_interface_found" = "1" ]; then
+    # Radio health and clients: AP interfaces from iw, stations from iwinfo.
+    # Do not report a successful zero-client sample if collection failed.
+    local wireless iface_list iface assoc client_macs=''
+    wireless=$(iw dev) || return 1
+    iface_list=$(printf '%s\n' "$wireless" | awk '
+        $1 == "Interface" { iface=$2 }
+        $1 == "type" && $2 == "AP" { print iface }
+    ')
+    wifi_status=0
+    for iface in $iface_list; do
+        assoc=$(iwinfo "$iface" assoclist) || return 1
         wifi_status=1
-        wifi_clients=$wifi_clients_total
-    else
-        wifi_status=0
-    fi
+        client_macs="$client_macs
+$(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
+    done
+    wifi_clients=$(printf '%s\n' "$client_macs" | awk '
+        NF && !seen[$1]++ { count++ }
+        END { print count+0 }
+    ')
 
-    # CPU
-    cpu=$(top -bn1 2>/dev/null | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1)
-    [ -z "$cpu" ] && cpu="0"
+    # Aggregate CPU busy percentage over one second. Guest counters are already
+    # included in user/nice, so sum only user..steal (the first eight counters).
+    local cpu_before cpu_after
+    cpu_before=$(awk '/^cpu / {
+        total=0; for (i=2; i<=9 && i<=NF; i++) total+=$i
+        print total, $5+$6; exit
+    }' /proc/stat) || return 1
+    sleep 1
+    cpu_after=$(awk '/^cpu / {
+        total=0; for (i=2; i<=9 && i<=NF; i++) total+=$i
+        print total, $5+$6; exit
+    }' /proc/stat) || return 1
+    cpu=$(awk -v before="$cpu_before" -v after="$cpu_after" 'BEGIN {
+        if (split(before,b)!=2 || split(after,a)!=2) {print "n/a"; exit}
+        total=a[1]-b[1]; idle=a[2]-b[2]
+        if (total<=0 || idle<0 || idle>total) {print "n/a"; exit}
+        printf "%.1f%%", 100*(total-idle)/total
+    }')
 
-    # RAM
-    ram=$(free -m 2>/dev/null | awk '/Mem:/ { printf "%dMB/%dMB", $3, $2 }')
-    [ -z "$ram" ] && ram="0MB/0MB"
+    # /proc/meminfo uses KiB. Used memory excludes reclaimable cache via
+    # MemAvailable; use a conservative fallback on kernels without that field.
+    ram=$(awk '
+        /^MemTotal:/ {total=$2}
+        /^MemAvailable:/ {available=$2; have_available=1}
+        /^MemFree:/ {free=$2}
+        /^Buffers:/ {buffers=$2}
+        /^Cached:/ {cached=$2}
+        /^SReclaimable:/ {reclaimable=$2}
+        /^Shmem:/ {shared=$2}
+        END {
+            if (total<=0) {print "n/a"; exit}
+            if (!have_available) available=free+buffers+cached+reclaimable-shared
+            if (available<0) available=0
+            if (available>total) available=total
+            printf "%.0fMiB/%.0fMiB", (total-available)/1024, total/1024
+        }
+    ' /proc/meminfo) || return 1
+
 
     # Состояние Podkop (если установлен)
     if command -v podkop > /dev/null 2>&1; then

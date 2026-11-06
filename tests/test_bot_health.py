@@ -62,6 +62,16 @@ class BotHealth(unittest.TestCase):
                 self.health['podkop_test'] = value
                 self.assertIn('Прокси: ' + expected, self.render())
 
+    def test_successful_proxy_latency_is_shown_in_milliseconds(self):
+        self.health.update(podkop_test=1, podkop_latency_ms=159)
+        self.assertIn('Прокси: ✅ (159 мс)', self.render())
+
+    def test_failed_or_unmeasured_probe_does_not_show_stale_latency(self):
+        for state in (0, None):
+            with self.subTest(state=state):
+                self.health.update(podkop_test=state, podkop_latency_ms=159)
+                self.assertNotIn('159 мс', self.render())
+
     def test_counts_are_separate_for_each_router(self):
         self.routers.append(dict(router_id='r2', name='Other'))
         self.records['r2'] = dict(self.health, wifi_clients=3)

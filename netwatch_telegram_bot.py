@@ -449,6 +449,8 @@ async def cmd_health(message: Message):
             net = "✅" if h["internet"] else "❌"
             wf = "✅" if h["wifi"] else "❌"
             pk = "не проверялся" if h["podkop_test"] is None else ("✅" if h["podkop_test"] else "⚠️")
+            if h["podkop_test"] and h.get("podkop_latency_ms") is not None:
+                pk += f" ({h['podkop_latency_ms']} мс)"
             podkop_status = {
                 "running": "sing-box работает",
                 "stopped": "sing-box остановлен",

@@ -231,6 +231,40 @@ class Transactions(unittest.TestCase):
                              ('running', None))
         self.assertTrue(all(c.closed for c in self.connections))
 
+    def test_health_stores_proxy_latency(self):
+        self.run_handler('post_health', dict(router_id='r', internet=True, wifi=True,
+                         cpu='13.7%', ram='192MiB/485MiB', wifi_clients=6,
+                         podkop_status='running', podkop_test=1, podkop_latency_ms=159))
+        row = db.get_latest_health('r')
+        self.assertEqual((row['podkop_test'], row['podkop_latency_ms']), (1, 159))
+
+    def test_health_rejects_invalid_latency_without_writing(self):
+        for value in (-1, 1.5, True, '159', 60001):
+            with self.subTest(value=value):
+                result = self.run_handler('post_health', dict(router_id='r', internet=True, wifi=True,
+                                         cpu='1%', ram='192MiB/485MiB', wifi_clients=6,
+                                         podkop_status='running', podkop_test=1, podkop_latency_ms=value))
+                self.assertEqual(result.status, 400)
+                self.assertEqual(self.count('health_checks'), 0)
+
+    def test_health_latency_migration_preserves_history_and_is_repeatable(self):
+        with db.db_session() as conn:
+            schema = conn.execute("SELECT sql FROM sqlite_master WHERE name='health_checks'").fetchone()['sql']
+            self.assertIn('podkop_latency_ms INTEGER,', schema)
+            conn.execute('DROP TABLE health_checks')
+            conn.execute(schema.replace('podkop_latency_ms INTEGER,', ''))
+            conn.execute("INSERT INTO health_checks(router_id, cpu, podkop_test, timestamp) VALUES ('r','2%',1,123)")
+        db.init_db()
+        db.init_db()
+        row = db.get_latest_health('r')
+        self.assertEqual((row['cpu'], row['timestamp'], row['podkop_test'], row['podkop_latency_ms']),
+                         ('2%', 123, 1, None))
+
+    def test_health_helper_accepts_nullable_probe_and_latency(self):
+        db.add_health_check('r', True, True, '2%', '192MiB/485MiB', 6, 'running', None, timestamp=123)
+        row = db.get_latest_health('r')
+        self.assertEqual((row['timestamp'], row['podkop_test'], row['podkop_latency_ms']), (123, None, None))
+
     def test_pair_and_auth(self):
         db.create_pairing_code('code', 1)
         result = self.run_handler('post_pair', dict(code='code', router_id='r'))

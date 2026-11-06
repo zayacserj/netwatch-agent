@@ -212,18 +212,22 @@ async def post_health(request):
     if not all(k in data for k in required):
         return web.json_response({"error": "Missing health fields"}, status=400)
 
+    latency = data.get("podkop_latency_ms")
+    if latency is not None and (type(latency) is not int or not 0 <= latency <= 60000):
+        return web.json_response({"error": "Invalid proxy latency"}, status=400)
+
     with db_session() as conn:
         timestamp = data.get("timestamp", int(time.time()))
         conn.execute("""
-            INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp, podkop_latency_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (data["router_id"],
               1 if data["internet"] else 0,
               1 if data["wifi"] else 0,
               data["cpu"], data["ram"], data["wifi_clients"],
               data["podkop_status"],
               None if data["podkop_test"] is None else (1 if data["podkop_test"] else 0),
-              timestamp))
+              timestamp, latency))
 
         # Обновляем last_seen роутера
         conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (data["router_id"],))

@@ -96,6 +96,7 @@ def init_db():
             wifi_clients INTEGER,
             podkop_status TEXT,
             podkop_test INTEGER,
+            podkop_latency_ms INTEGER,
             timestamp INTEGER DEFAULT (unixepoch()),
             FOREIGN KEY (router_id) REFERENCES routers(router_id) ON DELETE CASCADE
         );
@@ -135,6 +136,9 @@ def init_db():
 
     # Миграция: добавить новые колонки если таблица уже существует
     with db_session() as conn:
+        health_columns = [col["name"] for col in conn.execute("PRAGMA table_info(health_checks)").fetchall()]
+        if "podkop_latency_ms" not in health_columns:
+            conn.execute("ALTER TABLE health_checks ADD COLUMN podkop_latency_ms INTEGER")
         columns = [col["name"] for col in conn.execute("PRAGMA table_info(devices)").fetchall()]
         if "custom_name" not in columns:
             conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
@@ -412,13 +416,14 @@ def get_user_events(chat_id, hours=24):
 
 # --- health checks ---
 
-def add_health_check(router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp=None):
+def add_health_check(router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp=None, podkop_latency_ms=None):
     conn = get_conn()
     ts = timestamp or int(time.time())
     conn.execute("""
-        INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (router_id, 1 if internet else 0, 1 if wifi else 0, cpu, ram, wifi_clients, podkop_status, 1 if podkop_test else 0, ts))
+        INSERT INTO health_checks (router_id, internet, wifi, cpu, ram, wifi_clients, podkop_status, podkop_test, timestamp, podkop_latency_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (router_id, 1 if internet else 0, 1 if wifi else 0, cpu, ram, wifi_clients, podkop_status,
+          None if podkop_test is None else (1 if podkop_test else 0), ts, podkop_latency_ms))
     conn.commit()
     conn.close()
 

@@ -30,6 +30,7 @@ class HealthMetrics(unittest.TestCase):
         collection = source[start:end] + '}\n'
         collection = collection.replace('/proc/stat', self.stat.as_posix())
         collection = collection.replace('/proc/meminfo', self.mem.as_posix())
+        collection = collection.replace('/tmp/netwatch-probe.XXXXXX', (self.root / 'probe.XXXXXX').as_posix())
         self.script = self.root / 'health.sh'
         self.script.write_text('''set -e
 get_router_id() { echo rt_test; }
@@ -46,25 +47,38 @@ iwinfo() {
 }
 sleep() { cp "$STAT_AFTER" "$STAT_FILE"; }
 podkop() {
-    [ "$1" = get_sing_box_status ] || return 99
-    printf '%s' "$PODKOP_JSON"
-    return "${PODKOP_EXIT:-0}"
+    if [ "$1" = get_sing_box_status ]; then
+        printf '%s' "$PODKOP_JSON"
+        return "${PODKOP_EXIT:-0}"
+    fi
+    [ "$1" = clash_api ] || return 99
+    grep -q 'connect-timeout = 3' "$CURL_HOME/.curlrc" || return 98
+    grep -q 'max-time = 8' "$CURL_HOME/.curlrc" || return 98
+    printf '%s %s %s\\n' "$2" "$3" "$4" >> "$PROXY_CALL_LOG"
+    case "$2" in
+        get_proxies) printf '%s' "$PROXIES_JSON"; return "${PROXIES_EXIT:-0}" ;;
+        get_proxy_latency) printf '%s' "$LATENCY_JSON"; return "${LATENCY_EXIT:-0}" ;;
+        *) return 99 ;;
+    esac
 }
 capture() {
     jq -cn --arg cpu "$cpu" --arg ram "$ram" --argjson wifi "$wifi_status" \\
        --argjson clients "$wifi_clients" --arg podkop "$podkop_status" --argjson probe "$podkop_test" \\
-       '{cpu:$cpu,ram:$ram,wifi:$wifi,clients:$clients,podkop:$podkop,probe:$probe}'
+       --argjson latency "$podkop_latency_ms" \\
+       '{cpu:$cpu,ram:$ram,wifi:$wifi,clients:$clients,podkop:$podkop,probe:$probe,latency:$latency}'
 }
 ''' + collection.replace('\n}\n', '\n    capture\n}\n') + '\ncmd_run\n',
                                encoding='utf-8', newline='\n')
         self.env = dict(os.environ, STAT_AFTER=self.after.as_posix(), STAT_FILE=self.stat.as_posix(),
                         WIRELESS='phy#0\n Interface phy0-ap0\n type AP\nphy#1\n Interface phy1-ap0\n type AP',
-                        ASSOC0='', ASSOC1='', RADIO_FAIL='0', PODKOP_JSON='{"running":1,"enabled":0}', PODKOP_EXIT='0')
+                        ASSOC0='', ASSOC1='', RADIO_FAIL='0', PODKOP_JSON='{"running":1,"enabled":0}', PODKOP_EXIT='0',
+                        PROXIES_JSON='{}', PROXIES_EXIT='0', LATENCY_JSON='{}', LATENCY_EXIT='0',
+                        PROXY_CALL_LOG=(self.root / 'calls').as_posix(), PODKOP_GROUP='main-out')
 
     def run_health(self, **env):
         command = [SHELL, 'sh'] if 'busybox' in Path(SHELL).name.lower() else [SHELL]
         return subprocess.run(command + [str(self.script)], env=dict(self.env, **env),
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, text=True, timeout=15)
 
     def metrics(self, **env):
         result = self.run_health(**env)
@@ -141,3 +155,86 @@ capture() {
 
     def test_podkop_missing_runtime_field_reports_unknown(self):
         self.assertEqual(self.metrics(PODKOP_JSON='{"enabled":1}')['podkop'], 'unknown')
+
+    def proxy_map(self, leaf='main-1-out', kind='VLESS'):
+        return json.dumps({'proxies': {
+            'main-out': {'type': 'Selector', 'now': 'main-urltest-out'},
+            'main-urltest-out': {'type': 'URLTest', 'now': leaf},
+            leaf: {'type': kind},
+        }})
+
+    def test_proxy_latency_follows_active_nested_selection(self):
+        values = self.metrics(PROXIES_JSON=self.proxy_map(), LATENCY_JSON='{"delay":159}')
+        self.assertEqual((values['probe'], values['latency']), (1, 159))
+        self.assertIn('get_proxy_latency main-1-out 5000', (self.root / 'calls').read_text())
+        self.assertEqual(list(self.root.glob('probe.*')), [])
+
+    def test_proxy_selection_is_not_hardcoded(self):
+        values = self.metrics(PROXIES_JSON=self.proxy_map('main-2-out'), LATENCY_JSON='{"delay":45}')
+        self.assertEqual(values['latency'], 45)
+        self.assertIn('get_proxy_latency main-2-out 5000', (self.root / 'calls').read_text())
+
+    def test_proxy_tag_is_url_encoded(self):
+        self.metrics(PROXIES_JSON=self.proxy_map('node two'), LATENCY_JSON='{"delay":100}')
+        self.assertIn('get_proxy_latency node%20two 5000', (self.root / 'calls').read_text())
+
+    def test_proxy_timeout_is_distinct_from_unmeasured(self):
+        values = self.metrics(PROXIES_JSON=self.proxy_map(), LATENCY_JSON='{"message":"Timeout"}')
+        self.assertEqual(values['probe'], 0)
+        self.assertIsNone(values['latency'])
+
+    def test_unsupported_proxy_command_stays_unmeasured(self):
+        values = self.metrics(PROXIES_EXIT='1')
+        self.assertIsNone(values['probe'])
+        self.assertIsNone(values['latency'])
+
+    def test_direct_route_is_not_reported_as_proxy_success(self):
+        values = self.metrics(PROXIES_JSON=self.proxy_map('DIRECT', 'Direct'), LATENCY_JSON='{"delay":1}')
+        self.assertIsNone(values['probe'])
+        self.assertNotIn('get_proxy_latency', (self.root / 'calls').read_text())
+
+    def test_cyclic_proxy_group_does_not_loop_or_probe(self):
+        proxies = json.dumps({'proxies': {'main-out': {'type': 'Selector', 'now': 'main-out'}}})
+        values = self.metrics(PROXIES_JSON=proxies)
+        self.assertIsNone(values['probe'])
+        self.assertNotIn('get_proxy_latency', (self.root / 'calls').read_text())
+
+    def test_invalid_latency_cannot_be_reported_as_success(self):
+        for value in (-1, '159', 1.5, True, 60001):
+            with self.subTest(value=value):
+                values = self.metrics(PROXIES_JSON=self.proxy_map(), LATENCY_JSON=json.dumps({'delay': value}))
+                self.assertIsNone(values['probe'])
+                self.assertIsNone(values['latency'])
+
+    def test_full_run_serializes_measured_latency_in_health_payload(self):
+        source = AGENT.read_text(encoding='utf-8')
+        start = source.index('cmd_run() {')
+        end = source.index('\n}\n', start) + 3
+        function = source[start:end].replace('/proc/stat', self.stat.as_posix())
+        function = function.replace('/proc/meminfo', self.mem.as_posix())
+        function = function.replace('/tmp/netwatch-probe.XXXXXX', (self.root / 'probe.XXXXXX').as_posix())
+        prefix = self.script.read_text(encoding='utf-8').split('cmd_run() {', 1)[0]
+        self.script.write_text(prefix + '''
+json_escape() { printf '%s' "$1"; }
+curl() {
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = -d ]; then
+            printf '%s' "$2" > "$CAPTURE_PAYLOAD"
+            shift 2
+        else
+            shift
+        fi
+    done
+    return 0
+}
+''' + function + '\ncmd_run\n', encoding='utf-8', newline='\n')
+        payload = self.root / 'health.json'
+        result = self.run_health(PROXIES_JSON=self.proxy_map(), LATENCY_JSON='{"delay":159}',
+                                 CAPTURE_PAYLOAD=payload.as_posix(), PI_URL='http://example.invalid',
+                                 AGENT_SECRET='test-only-secret')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(payload.read_text())
+        self.assertEqual((data['podkop_status'], data['podkop_test'], data['podkop_latency_ms']),
+                         ('running', 1, 159))
+        self.assertEqual(data['cpu'], '50.0%')
+        self.assertEqual(data['ram'], '128MiB/512MiB')

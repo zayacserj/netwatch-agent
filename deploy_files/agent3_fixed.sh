@@ -196,6 +196,7 @@ cmd_run() {
     local wifi_clients=0
     local podkop_status="unknown"
     local podkop_test=null
+    local podkop_latency_ms=null
 
     # Проверка интернета
     if ping -c 1 -W 3 8.8.8.8 > /dev/null 2>&1; then
@@ -264,7 +265,6 @@ $(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
 
 
     # Podkop 0.7.x exposes sing-box runtime state separately from autostart.
-    # Connectivity/latency is not tested by this command: keep it unknown.
     if command -v podkop > /dev/null 2>&1; then
         local podkop_json
         if podkop_json=$(podkop get_sing_box_status 2>/dev/null); then
@@ -276,6 +276,50 @@ $(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
         fi
     else
         podkop_status="not_installed"
+    fi
+
+    # Follow the currently selected proxy, including nested Selector/URLTest.
+    # CURL_HOME confines timeouts to these Podkop CLI calls; no global config
+    # or proxy selection is modified. Old/unsupported commands stay unknown.
+    if [ "$podkop_status" = running ]; then
+        local probe_dir proxies proxy_tag encoded_tag latency_json measured
+        if probe_dir=$(mktemp -d /tmp/netwatch-probe.XXXXXX); then
+            if printf 'connect-timeout = 3\nmax-time = 8\n' > "$probe_dir/.curlrc"; then
+                if proxies=$(CURL_HOME="$probe_dir" podkop clash_api get_proxies 2>/dev/null); then
+                    proxy_tag=$(printf '%s' "$proxies" | jq -er --arg root "${PODKOP_GROUP:-main-out}" '
+                        .proxies as $p |
+                        def leaf($tag; $seen):
+                            if ($seen | index($tag)) != null or ($seen | length) >= 8 then empty
+                            elif ($p[$tag] | type) != "object" then empty
+                            elif $p[$tag].type == "Selector" or $p[$tag].type == "URLTest" then
+                                ($p[$tag].now // "") as $next |
+                                if $next == "" then empty else leaf($next; $seen + [$tag]) end
+                            elif ($p[$tag].type | type) != "string" then empty
+                            elif ($p[$tag].type | ascii_downcase) as $t |
+                                 ($t == "direct" or $t == "reject" or $t == "block" or $t == "dns") then empty
+                            else $tag end;
+                        leaf($root; [])
+                    ' 2>/dev/null) || proxy_tag=''
+                    if [ -n "$proxy_tag" ]; then
+                        encoded_tag=$(printf '%s' "$proxy_tag" | jq -sRr @uri)
+                        if latency_json=$(CURL_HOME="$probe_dir" podkop clash_api get_proxy_latency "$encoded_tag" 5000 2>/dev/null); then
+                            if measured=$(printf '%s' "$latency_json" | jq -er '
+                                .delay | select(type == "number" and . >= 0 and . <= 60000 and . == floor)
+                            ' 2>/dev/null); then
+                                podkop_latency_ms="$measured"
+                                podkop_test=1
+                            elif printf '%s' "$latency_json" | jq -e '
+                                type == "object" and (has("message") or has("error"))
+                            ' >/dev/null 2>&1; then
+                                podkop_test=0
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+            rm -f "$probe_dir/.curlrc"
+            rmdir "$probe_dir" 2>/dev/null || true
+        fi
     fi
 
     # Экранируем строковые значения для JSON
@@ -341,7 +385,7 @@ $(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
     curl -sS -4 -X POST "$PI_URL/health" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Secret: $AGENT_SECRET" \
-        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu_escaped\",\"ram\":\"$ram_escaped\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status_escaped\",\"podkop_test\":$podkop_test,\"timestamp\":$timestamp}"
+        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu_escaped\",\"ram\":\"$ram_escaped\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status_escaped\",\"podkop_test\":$podkop_test,\"podkop_latency_ms\":$podkop_latency_ms,\"timestamp\":$timestamp}"
     echo ""
 }
 

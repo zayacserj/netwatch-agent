@@ -230,9 +230,23 @@ curl() { ''' + shlex.quote(Path(sys.executable).as_posix()) + ' ' + shlex.quote(
 
     def test_different_api_requires_explicit_repair(self):
         self.seed_existing()
-        result = self.run_agent('pair', '--code', '11223344', '--url', 'http://other.invalid')
+        result = self.run_agent('pair', '--code', '11223344', '--url', 'https://other.invalid', IDENTITY_HTTP='403')
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.requests(), [])
+        self.assertEqual(len(self.requests()), 1)
+        self.assertIsNone(self.requests()[0]['body'])
+        self.assertIn('PI_URL="http://pi.invalid:8080"', self.config.read_text())
+
+    def test_verified_canonical_url_migration_preserves_binding_and_options(self):
+        self.seed_existing()
+        result = self.run_agent('pair', '--code', '11223344', '--url', 'https://api.example.invalid')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        config = self.config.read_text()
+        self.assertIn('PI_URL="https://api.example.invalid"', config)
+        self.assertIn('ROUTER_ID="rt_old"', config)
+        self.assertIn('AGENT_SECRET="' + 'b'*32 + '"', config)
+        self.assertIn('PODKOP_GROUP="custom-out"', config)
+        self.assertTrue(all(r['body'] is None for r in self.requests()))
+        self.assert_cron()
 
     def test_config_is_source_of_router_id_even_with_legacy_file(self):
         self.seed_existing()

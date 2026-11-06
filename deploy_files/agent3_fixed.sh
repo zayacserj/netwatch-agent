@@ -144,11 +144,7 @@ cmd_pair() {
 
     local reuse=0
     if [ -n "${ROUTER_ID:-}" ] && [ -n "${AGENT_SECRET:-}" ]; then
-        if [ "$url" != "${PI_URL%/}" ] && [ "$re_pair" != 1 ]; then
-            log "A different API is configured; use --re-pair only when moving this router"
-            return 1
-        fi
-        if [ "$url" = "${PI_URL%/}" ] && [ "$re_pair" != 1 ]; then
+        if [ "$re_pair" != 1 ]; then
             http=$(printf 'X-Agent-Secret: %s\n' "$AGENT_SECRET" |
                 curl --silent --show-error --connect-timeout 5 --max-time 15 \
                 --header @- --output "$work/identity.json" --write-out '%{http_code}' "$url/agent/identity") || return 1
@@ -160,7 +156,11 @@ cmd_pair() {
                         return 1
                     }
                     reuse=1 ;;
-                403) : ;;
+                403)
+                    if [ "$url" != "${PI_URL%/}" ]; then
+                        log "The new API does not confirm this binding; use --re-pair only when moving this router"
+                        return 1
+                    fi ;;
                 *) log "Cannot verify current binding (HTTP $http); no changes made"; return 1 ;;
             esac
         fi
@@ -168,7 +168,13 @@ cmd_pair() {
 
     if [ "$reuse" = 1 ]; then
         netwatch_valid_id "$ROUTER_ID" || return 1
-        cp -p "$CONFIG_FILE" "$work/config.new" || return 1
+        if [ "$url" = "${PI_URL%/}" ]; then
+            cp -p "$CONFIG_FILE" "$work/config.new" || return 1
+        else
+            awk '!/^[[:space:]]*(export[[:space:]]+)?PI_URL=/' "$CONFIG_FILE" > "$work/config.new" || return 1
+            printf '\nPI_URL="%s"\n' "$url" >> "$work/config.new" || return 1
+            log "Canonical API address verified; updating only the API address"
+        fi
         log "Existing binding verified; router ID and secret will be preserved"
     else
         [ -n "$code" ] || { log "A fresh code from /add_router is required"; return 1; }

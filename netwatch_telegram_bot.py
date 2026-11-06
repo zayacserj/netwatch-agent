@@ -87,30 +87,73 @@ async def cmd_start(message: Message):
 
 
 # --- /add_router ---
+def _agent_install_command(code, url):
+    from shlex import quote
+    from urllib.parse import urlsplit
+
+    release_ref = "d8b0aa40bb48a51cab4657240cac4567cded8940"
+    agent_sha256 = "855c75293d81a707e5c3eea5a90bfb757d8bbe5fef84973f5187c4e53b592ca1"
+    if (not isinstance(code, str) or len(code) != 8
+            or any(c not in "0123456789abcdefABCDEF" for c in code)):
+        raise ValueError("Invalid pairing code")
+    if not isinstance(url, str) or any(ord(c) <= 32 or ord(c) == 127 for c in url):
+        raise ValueError("Invalid API address")
+    if any(c in url for c in "\"'`$\\"):
+        raise ValueError("Invalid API address")
+    url = url.rstrip("/")
+    parts = urlsplit(url)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.query or parts.fragment):
+        raise ValueError("Invalid API address")
+    if parts.port is not None and not 1 <= parts.port <= 65535:
+        raise ValueError("Invalid API port")
+    source = f"https://raw.githubusercontent.com/zayacserj/netwatch-agent/{release_ref}/deploy_files/agent3_fixed.sh"
+    return (
+        "(\n"
+        "  set -e\n"
+        "  umask 077\n"
+        "  nw_install_dir=$(mktemp -d /tmp/netwatch-install.XXXXXX)\n"
+        "  trap 'rm -f \"$nw_install_dir/agent.sh\"; rmdir \"$nw_install_dir\" 2>/dev/null || true' 0\n"
+        f"  curl --disable --fail --silent --show-error --connect-timeout 5 --max-time 30 --proto '=https' {quote(source)} --output \"$nw_install_dir/agent.sh\"\n"
+        f"  printf '%s  %s\\n' {quote(agent_sha256)} \"$nw_install_dir/agent.sh\" | sha256sum -c -\n"
+        "  sh -n \"$nw_install_dir/agent.sh\"\n"
+        f"  sh \"$nw_install_dir/agent.sh\" pair --code {quote(code)} --url {quote(url)}\n"
+        ")"
+    )
+
+
 @dp.message(Command("add_router"))
 async def cmd_add_router(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    code = secrets.token_hex(4)  # 8 hex chars = 4 bytes
-    create_pairing_code(code, message.from_user.id, expires_sec=900)
-
-    github_agent_url = "https://raw.githubusercontent.com/zayacserj/netwatch-agent/master/deploy_files/agent3_fixed.sh"
+    code = secrets.token_hex(4)
     pi_url = os.getenv("PI_URL", "http://192.168.10.222:8080")
-    pi_url_public = os.getenv("PI_URL_PUBLIC", "http://95.31.29.233:8080")
-    
+    pi_url_public = os.getenv("PI_URL_PUBLIC", "")
+    try:
+        local_command = _agent_install_command(code, pi_url)
+    except ValueError:
+        await message.reply("Не удалось подготовить подключение: проверьте адрес сервера NetWatch.")
+        return
+
     text = (
-        f"🔐 Код подключения роутера:\n\n"
-        f"`{code}`\n\n"
-        f"Действует 15 минут.\n\n"
-        f"🚀 Быстрая установка (локальная сеть):\n"
-        f"```\n"
-        f"curl -sS {github_agent_url} -o /tmp/agent3.sh && chmod +x /tmp/agent3.sh && /tmp/agent3.sh pair --code {code} --url {pi_url}\n"
-        f"```\n\n"
-        f"🌐 Для роутеров в другой сети (интернет):\n"
-        f"```\n"
-        f"curl -sS {github_agent_url} -o /tmp/agent3.sh && chmod +x /tmp/agent3.sh && /tmp/agent3.sh pair --code {code} --url {pi_url_public}\n"
-        f"```\n"
+        f"🔐 Код подключения роутера: `{code}`\n"
+        "Действует 15 минут. Выполните весь блок от root на OpenWrt.\n"
+        "Нужны curl, jq, iw и iwinfo; отсутствующие пакеты автоматически не устанавливаются.\n\n"
+        f"🏠 Роутер в одной сети с сервером:\n```\n{local_command}\n```\n"
     )
-    await message.reply(text)
+    public_command = None
+    if pi_url_public.startswith("https://"):
+        try:
+            public_command = _agent_install_command(code, pi_url_public)
+        except ValueError:
+            pass
+    if public_command:
+        text += f"\n🌐 Роутер в другой сети:\n```\n{public_command}\n```\n"
+    else:
+        text += "\nДля подключения из другой сети нужен настроенный публичный HTTPS-адрес сервера.\n"
+    text += "\nСуществующая рабочая привязка и задания других программ сохраняются."
+    create_pairing_code(code, message.from_user.id, expires_sec=900)
+    await message.reply(text, parse_mode="Markdown")
 
 
 # --- /routers ---

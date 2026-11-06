@@ -273,6 +273,96 @@ class Transactions(unittest.TestCase):
         self.assertIsNone(db.get_pairing_code('code'))
         self.assertTrue(all(c.closed for c in self.connections))
 
+    def test_pair_commit_failure_keeps_code_unused_and_router_absent(self):
+        db.create_pairing_code('code', 1)
+        self.fail_commit = True
+        with self.assertRaises(sqlite3.OperationalError):
+            self.run_handler('post_pair', dict(code='code', router_id='new'))
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT used FROM pairing_codes WHERE code='code'").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM routers WHERE router_id='new'").fetchone()[0], 0)
+            self.assertEqual(conn.execute('SELECT count(*) FROM router_secrets').fetchone()[0], 0)
+        self.assertTrue(self.connections[-1].rolled_back)
+        self.assertTrue(self.connections[-1].closed)
+
+    def test_pair_failure_after_router_upsert_rolls_everything_back(self):
+        db.create_pairing_code('code', 1)
+        with patch.object(api.secrets, 'token_hex', side_effect=RuntimeError('injected failure')):
+            with self.assertRaises(RuntimeError):
+                self.run_handler('post_pair', dict(code='code', router_id='new'))
+        self.assertIsNotNone(db.get_pairing_code('code'))
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM routers WHERE router_id='new'").fetchone()[0], 0)
+
+    def test_pair_replay_cannot_rotate_secret_or_add_router(self):
+        db.create_pairing_code('code', 1)
+        first = self.run_handler('post_pair', dict(code='code', router_id='new'))
+        secret = json.loads(first.text)['agent_secret']
+        replay = self.run_handler('post_pair', dict(code='code', router_id='another'))
+        self.assertEqual(replay.status, 403)
+        self.assertTrue(db.is_valid_router_secret(secret))
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM routers WHERE router_id='another'").fetchone()[0], 0)
+
+    def test_pair_rejects_another_owners_router_without_consuming_code(self):
+        with db.db_session() as conn:
+            conn.execute('INSERT INTO users(chat_id) VALUES (2)')
+            conn.execute("INSERT INTO router_secrets VALUES ('r','original')")
+        db.create_pairing_code('other-code', 2)
+        result = self.run_handler('post_pair', dict(code='other-code', router_id='r'))
+        self.assertEqual(result.status, 409)
+        self.assertIsNotNone(db.get_pairing_code('other-code'))
+        self.assertTrue(db.is_valid_router_secret('original'))
+
+    def test_pair_returns_canonical_router_id_and_records_it_on_code(self):
+        with db.db_session() as conn:
+            conn.execute("UPDATE routers SET mac='aa:bb:cc:dd:ee:ff' WHERE router_id='r'")
+        db.create_pairing_code('code', 1)
+        result = self.run_handler('post_pair', dict(code='code', router_id='new', mac='AA:BB:CC:DD:EE:FF',
+                                                  name='Cudy "Router"'))
+        self.assertEqual(json.loads(result.text)['router_id'], 'r')
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT router_id, used FROM pairing_codes WHERE code='code'").fetchone(), ('r', 1))
+            self.assertEqual(conn.execute('SELECT count(*) FROM routers').fetchone()[0], 1)
+
+    def test_pair_expired_code_is_not_consumed(self):
+        db.create_pairing_code('expired', 1, expires_sec=-1)
+        result = self.run_handler('post_pair', dict(code='expired', router_id='new'))
+        self.assertEqual(result.status, 403)
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT used FROM pairing_codes WHERE code='expired'").fetchone()[0], 0)
+
+    def test_pair_invalid_payloads_are_rejected_without_writes(self):
+        for data in ([], {'code': 'x', 'router_id': 'bad id'}, {'code': [], 'router_id': 'new'},
+                     {'code': 'x', 'router_id': 'new', 'mac': 'bad-mac'}):
+            with self.subTest(data=data):
+                result = self.run_handler('post_pair', data)
+                self.assertEqual(result.status, 400)
+                self.assertEqual(self.count('routers'), 1)
+                self.assertEqual(self.count('router_secrets'), 0)
+
+    def test_identity_returns_only_the_authenticated_router(self):
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO router_secrets VALUES ('r','private-secret')")
+        request = Request({})
+        request.headers = {'X-Agent-Secret': 'private-secret'}
+        result = asyncio.run(api.get_agent_identity(request))
+        self.assertEqual(json.loads(result.text), {'router_id': 'r'})
+        request.headers = {'X-Agent-Secret': 'invalid'}
+        self.assertEqual(asyncio.run(api.get_agent_identity(request)).status, 403)
+        self.assertTrue(all(c.closed for c in self.connections))
+
+    def test_only_one_concurrent_request_can_consume_a_pairing_code(self):
+        from concurrent.futures import ThreadPoolExecutor
+        db.create_pairing_code('shared-code', 1)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(self.run_handler, 'post_pair', dict(code='shared-code', router_id=router))
+                       for router in ('first', 'second')]
+            statuses = [f.result().status for f in futures]
+        self.assertEqual(sorted(statuses), [200, 403])
+        self.assertEqual(self.count('router_secrets'), 1)
+        self.assertEqual(self.count('routers'), 2)
+
     def test_standalone_mark_commit_failure(self):
         with db.db_session() as conn:
             conn.execute("INSERT INTO devices(mac,router_id) VALUES ('aa','r')")

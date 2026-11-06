@@ -219,8 +219,8 @@ def clean_user_data(chat_id):
 
 # --- routers ---
 
-def upsert_router(router_id, chat_id, name=None, mac=None, model=None):
-    with db_session() as conn:
+def upsert_router(router_id, chat_id, name=None, mac=None, model=None, conn=None):
+    with db_session(conn) as conn:
 
         # Если есть MAC — проверить, есть ли уже роутер с таким MAC
         if mac:

@@ -5,7 +5,9 @@
 set -e
 
 CONFIG_FILE="/etc/netwatch/config"
-LOG_FILE="/mnt/usb/log/netwatch/netwatch-agent.log"
+AGENT_FILE="/etc/netwatch/agent3.sh"
+INSTALL_LOCK="/tmp/netwatch-install.lock"
+LOG_FILE=""
 
 # Загрузка конфига
 if [ -f "$CONFIG_FILE" ]; then
@@ -20,7 +22,7 @@ log() {
     local ts=$(date '+%Y-%m-%d %H:%M:%S')
     local msg="[$ts] $1"
     echo "$msg"
-    if [ -d "$(dirname "$LOG_FILE")" ] 2>/dev/null; then
+    if [ -n "$LOG_FILE" ] && [ -d "$(dirname "$LOG_FILE")" ] 2>/dev/null; then
         echo "$msg" >> "$LOG_FILE"
     fi
 }
@@ -30,66 +32,225 @@ json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\//\\\//g; s/\t/\\t/g; s/\n/\\n/g; s/\r/\\r/g'
 }
 
+# --- installation helpers ---
+netwatch_lock() {
+    if ! mkdir "$INSTALL_LOCK" 2>/dev/null; then
+        log "Installation is already in progress (lock: $INSTALL_LOCK)"
+        return 1
+    fi
+    trap 'rmdir "$INSTALL_LOCK" 2>/dev/null || true' 0
+    trap 'exit 1' 1 2 15
+}
+
+netwatch_valid_id() {
+    [ -n "$1" ] && [ "${#1}" -le 32 ] || return 1
+    case "$1" in *[!A-Za-z0-9_-]*) return 1 ;; esac
+}
+
+netwatch_cron_read() {
+    if [ -f /etc/crontabs/root ]; then
+        cat /etc/crontabs/root > "$1" || return 1
+    else
+        : > "$1" || return 1
+    fi
+}
+
+netwatch_cron_prepare() {
+    awk -v agent="$AGENT_FILE" '
+        /^[[:space:]]*#/ { print; next }
+        {
+            owned=0
+            for (i=6; i<NF; i++)
+                if (($i==agent || $i=="/tmp/agent3.sh") && $(i+1) ~ /^(run|snapshot)$/) owned=1
+            if (!owned) print
+        }
+    ' "$1/cron.before" > "$1/cron.new" || return 1
+    printf '* * * * * %s snapshot 2>&1 | logger -t netwatch-agent\n*/5 * * * * %s run 2>&1 | logger -t netwatch-agent\n' \
+        "$AGENT_FILE" "$AGENT_FILE" >> "$1/cron.new" || return 1
+}
+
+netwatch_cron_apply() {
+    netwatch_cron_read "$1/cron.current" || return 1
+    if ! cmp -s "$1/cron.before" "$1/cron.current"; then
+        log "Cron changed during installation; refusing to overwrite it"
+        return 1
+    fi
+    crontab "$1/cron.new" || return 1
+}
+
+netwatch_restore_files() {
+    if [ -f "$1/agent.before" ]; then
+        cp -p "$1/agent.before" "$1/agent.restore" && mv "$1/agent.restore" "$AGENT_FILE" || return 1
+    else
+        rm -f "$AGENT_FILE" || return 1
+    fi
+    if [ -f "$1/config.before" ]; then
+        cp -p "$1/config.before" "$1/config.restore" && mv "$1/config.restore" "$CONFIG_FILE" || return 1
+    else
+        rm -f "$CONFIG_FILE" || return 1
+    fi
+}
+
 # --- pair ---
 cmd_pair() {
-    log "Начинаем pair..."
-
-    # Parse flags: --code <code> --url <url>
-    local code=""
-    local url=""
-    while [ $# -gt 0 ]; do
+    local code='' url='' re_pair=0 tool work router_id mac model http secret authority
+    while [ "$#" -gt 0 ]; do
         case "$1" in
-            --code) code="$2"; shift 2 ;;
-            --url) url="$2"; shift 2 ;;
-            *) shift ;;
+            --code|--url)
+                [ "$#" -ge 2 ] || { log "Missing flag value"; return 1; }
+                if [ "$1" = --code ]; then code="$2"; else url="$2"; fi
+                shift 2 ;;
+            --re-pair) re_pair=1; shift ;;
+            *) log "Unknown pairing flag"; return 1 ;;
         esac
     done
+    [ "$(id -u)" = 0 ] || { log "Run installation as root"; return 1; }
+    for tool in curl jq iw iwinfo crontab logger sha256sum awk cmp; do
+        command -v "$tool" >/dev/null 2>&1 || { log "Missing dependency: $tool (install it before pairing)"; return 1; }
+    done
+    url=${url%/}
+    case "$url" in http://*|https://*) ;; *) log "Invalid API URL"; return 1 ;; esac
+    case "$url" in *\"*|*\'*|*\`*|*\$*|*\\*|*\?*|*\#*) log "Invalid API URL"; return 1 ;; esac
+    if printf '%s' "$url" | LC_ALL=C grep -q '[[:space:][:cntrl:]]'; then
+        log "Invalid API URL"; return 1
+    fi
+    authority=${url#*://}; authority=${authority%%/*}
+    [ -n "$authority" ] || { log "Missing API host"; return 1; }
+    case "$authority" in *@*) log "Credentials in API URL are not supported"; return 1 ;; esac
+    if [ -n "$code" ]; then
+        [ "${#code}" = 8 ] || { log "Invalid pairing code format"; return 1; }
+        case "$code" in *[!0-9a-fA-F]*) log "Invalid pairing code format"; return 1 ;; esac
+    fi
+    [ ! -L /etc/netwatch ] && [ ! -L /etc/netwatch/backups ] && [ ! -L /etc/netwatch/pairing.pending_id ] \
+        && [ ! -L "$CONFIG_FILE" ] && [ ! -L "$AGENT_FILE" ] || {
+        log "Refusing installation through symlinks"; return 1;
+    }
+    if { [ -e "$CONFIG_FILE" ] && [ ! -f "$CONFIG_FILE" ]; } \
+        || { [ -e "$AGENT_FILE" ] && [ ! -f "$AGENT_FILE" ]; }; then
+        log "Installation target is not a regular file"; return 1
+    fi
+    netwatch_lock || return 1
+    umask 077
+    mkdir -p /etc/netwatch/backups || return 1
+    work=$(mktemp -d /etc/netwatch/backups/install.XXXXXX) || return 1
+    log "Installation backup: $work"
+    if [ -f "$CONFIG_FILE" ]; then cp -p "$CONFIG_FILE" "$work/config.before" || return 1; fi
+    if [ -f "$AGENT_FILE" ]; then cp -p "$AGENT_FILE" "$work/agent.before" || return 1; fi
+    netwatch_cron_read "$work/cron.before" || return 1
+    netwatch_cron_prepare "$work" || return 1
+    cp "$0" "$work/agent.new" || return 1
+    sh -n "$work/agent.new" || return 1
+    chmod 755 "$work/agent.new" || return 1
 
-    if [ -z "$code" ] || [ -z "$url" ]; then
-        echo "Использование: $0 pair --code <код> --url <url>"
-        exit 1
+    local reuse=0
+    if [ -n "${ROUTER_ID:-}" ] && [ -n "${AGENT_SECRET:-}" ]; then
+        if [ "$url" != "${PI_URL%/}" ] && [ "$re_pair" != 1 ]; then
+            log "A different API is configured; use --re-pair only when moving this router"
+            return 1
+        fi
+        if [ "$url" = "${PI_URL%/}" ] && [ "$re_pair" != 1 ]; then
+            http=$(printf 'X-Agent-Secret: %s\n' "$AGENT_SECRET" |
+                curl --silent --show-error --connect-timeout 5 --max-time 15 \
+                --header @- --output "$work/identity.json" --write-out '%{http_code}' "$url/agent/identity") || return 1
+            case "$http" in
+                200)
+                    router_id=$(jq -er '.router_id | select(type=="string")' "$work/identity.json") || return 1
+                    [ "$router_id" = "$ROUTER_ID" ] || {
+                        log "Configured router ID does not match the server binding; no changes made"
+                        return 1
+                    }
+                    reuse=1 ;;
+                403) : ;;
+                *) log "Cannot verify current binding (HTTP $http); no changes made"; return 1 ;;
+            esac
+        fi
     fi
 
-    local router_id="rt_$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "rt_$(date +%s)_$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo 0)")"
-    router_id="${router_id:0:13}"
-    local mac=$(cat /sys/class/net/wlan0/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || echo "unknown")
-    local model=$(cat /tmp/sysinfo/model 2>/dev/null || echo "OpenWrt Router")
-
-    local json_payload='{"code":"'"$code"'","router_id":"'"$router_id"'","mac":"'"$mac"'","name":"'"$model"'","model":"'"$model"'"}'
-
-    local response=$(curl -sS -4 -X POST "$url/pair" \
-        -H "Content-Type: application/json" \
-        -d "$json_payload")
-
-    echo "Ответ Pi: $response"
-
-    local agent_secret=$(echo "$response" | grep -o '"agent_secret"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*:[^"]*"\([^"]*\)"$/\1/')
-    if [ -z "$agent_secret" ]; then
-        echo "Ошибка: не удалось получить agent_secret"
-        exit 1
+    if [ "$reuse" = 1 ]; then
+        netwatch_valid_id "$ROUTER_ID" || return 1
+        cp -p "$CONFIG_FILE" "$work/config.new" || return 1
+        log "Existing binding verified; router ID and secret will be preserved"
+    else
+        [ -n "$code" ] || { log "A fresh code from /add_router is required"; return 1; }
+        router_id=$(get_router_id)
+        if [ -z "$router_id" ] && [ -f /etc/netwatch/pairing.pending_id ]; then
+            router_id=$(cat /etc/netwatch/pairing.pending_id)
+        fi
+        if [ -z "$router_id" ]; then
+            router_id=$(tr -d '-' < /proc/sys/kernel/random/uuid | cut -c1-16)
+            [ "${#router_id}" = 16 ] || { log "Cannot generate a unique router ID"; return 1; }
+            case "$router_id" in *[!0-9a-fA-F]*) log "Invalid system UUID"; return 1 ;; esac
+            router_id="rt_$router_id"
+        fi
+        netwatch_valid_id "$router_id" || { log "Invalid router ID"; return 1; }
+        printf '%s\n' "$router_id" > /etc/netwatch/pairing.pending_id || return 1
+        mac=$(cat /sys/class/net/br-lan/address 2>/dev/null || cat /sys/class/net/eth0/address 2>/dev/null || true)
+        mac=$(printf '%s\n' "$mac" | tr '[:upper:]' '[:lower:]' | awk '
+            length($0)==17 && split($0,a,":")==6 {
+                for(i=1;i<=6;i++) if(a[i] !~ /^[0-9a-f][0-9a-f]$/) exit
+                print
+            }')
+        model=$(cat /tmp/sysinfo/model 2>/dev/null || printf 'OpenWrt Router')
+        printf '%s' "$code" | jq -Rs --arg id "$router_id" --arg mac "$mac" --arg model "$model" '
+            {code:.,router_id:$id,name:$model,model:$model,mac:(if $mac=="" then null else $mac end)}
+        ' > "$work/payload.json" || return 1
+        # Never automatically retry a code-consuming request or print its secret response.
+        http=$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
+            --header 'Content-Type: application/json' --data-binary @"$work/payload.json" \
+            --output "$work/response.json" --write-out '%{http_code}' "$url/pair") || {
+                log "Pairing result is uncertain; keep $work and request a fresh code before retrying"
+                return 1
+            }
+        [ "$http" = 200 ] || { log "Pairing rejected (HTTP $http); runtime files are unchanged"; return 1; }
+        jq -e '.status=="paired" and (.router_id|type=="string") and (.agent_secret|type=="string")' \
+            "$work/response.json" >/dev/null || return 1
+        router_id=$(jq -r '.router_id' "$work/response.json")
+        secret=$(jq -r '.agent_secret' "$work/response.json")
+        netwatch_valid_id "$router_id" || return 1
+        [ "${#secret}" = 32 ] || return 1
+        case "$secret" in *[!0-9a-f]*) return 1 ;; esac
+        printf '%s\n' "$router_id" > /etc/netwatch/pairing.pending_id || return 1
+        if [ -f "$CONFIG_FILE" ]; then
+            awk '!/^[[:space:]]*(export[[:space:]]+)?(PI_URL|ROUTER_ID|AGENT_SECRET)=/' \
+                "$CONFIG_FILE" > "$work/config.new" || return 1
+        else
+            : > "$work/config.new" || return 1
+        fi
+        printf '\nPI_URL="%s"\nROUTER_ID="%s"\nAGENT_SECRET="%s"\n' \
+            "$url" "$router_id" "$secret" >> "$work/config.new" || return 1
     fi
-
-    mkdir -p /etc/netwatch
-    cat > "$CONFIG_FILE" << EOF
-PI_URL="$url"
-ROUTER_ID="$router_id"
-AGENT_SECRET="$agent_secret"
-EOF
-    chmod 600 "$CONFIG_FILE"
-    # Copy this script to /etc/netwatch/ for cron
-    cp "$0" /etc/netwatch/agent3.sh
-    chmod +x /etc/netwatch/agent3.sh
-
-    # Авто-установка cron
-    cmd_install_cron
-
-    # Авто-запуск агента после pair
-    log "Авто-запуск агента..."
-    # Первый запуск сразу
-    /etc/netwatch/agent3.sh run
-    /etc/init.d/netwatch-wifi-monitor start 2>/dev/null || true
-    log "Агент установлен и запущен (snapshot каждую минуту, health-check каждые 5 мин, wifi-monitor)"
+    chmod 600 "$work/config.new" || return 1
+    sh -n "$work/config.new" || return 1
+    # A background/manual edit must not be overwritten by the staged installation.
+    if [ -f "$work/config.before" ]; then
+        cmp -s "$CONFIG_FILE" "$work/config.before" || return 1
+    else
+        [ ! -e "$CONFIG_FILE" ] || return 1
+    fi
+    if [ -f "$work/agent.before" ]; then
+        cmp -s "$AGENT_FILE" "$work/agent.before" || return 1
+    else
+        [ ! -e "$AGENT_FILE" ] || return 1
+    fi
+    mv "$work/agent.new" "$AGENT_FILE" || return 1
+    if ! mv "$work/config.new" "$CONFIG_FILE"; then
+        netwatch_restore_files "$work" || log "Rollback failed; restore files from $work"
+        return 1
+    fi
+    if ! netwatch_cron_apply "$work"; then
+        netwatch_restore_files "$work" || log "Rollback failed; restore files from $work"
+        log "Cron installation failed; runtime files restored. Keep backup: $work"
+        return 1
+    fi
+    rm -f /etc/netwatch/pairing.pending_id "$work/payload.json" "$work/response.json"
+    log "Installed: snapshot every minute, health every 5 minutes; logs: logread -e netwatch-agent"
+    if sh "$AGENT_FILE" run; then
+        log "Initial data delivery completed"
+    else
+        log "Installed, but initial delivery failed; cron will retry (see system log)"
+    fi
 }
+
 
 # --- snapshot ---
 cmd_snapshot() {
@@ -153,31 +314,15 @@ cmd_snapshot() {
 
 # --- install-cron ---
 cmd_install_cron() {
-    log "Установка cron-задач для NetWatch Agent"
-
-    local crontab_content=$(crontab -l 2>/dev/null || echo "")
-
-    # Добавляем задачу snapshot раз в минуту
-    local snapshot_cron="* * * * * $0 snapshot >> /mnt/usb/log/netwatch/snapshot.log 2>&1"
-    if [[ "$crontab_content" != *"$0 snapshot"* ]]; then
-        echo "$crontab_content" | crontab -
-        echo "$snapshot_cron" | crontab -
-        log "Добавлена cron-задача: $snapshot_cron"
-    else
-        log "Cron-задача уже существует, пропускаем"
-    fi
-
-    # Добавляем задачу run каждые 5 минут
-    local run_cron="*/5 * * * * $0 run >> /mnt/usb/log/netwatch/run.log 2>&1"
-    if [[ "$crontab_content" != *"$0 run"* ]]; then
-        echo "$crontab_content" | crontab -
-        echo "$run_cron" | crontab -
-        log "Добавлена cron-задача: $run_cron"
-    else
-        log "Cron-задача run уже существует, пропускаем"
-    fi
-
-    log "Cron-задачи установлены"
+    local work
+    netwatch_lock || return 1
+    umask 077
+    mkdir -p /etc/netwatch/backups || return 1
+    work=$(mktemp -d /etc/netwatch/backups/cron.XXXXXX) || return 1
+    netwatch_cron_read "$work/cron.before" || return 1
+    netwatch_cron_prepare "$work" || return 1
+    netwatch_cron_apply "$work" || return 1
+    log "Cron installed; unrelated tasks preserved. Backup: $work"
 }
 
 # --- run ---
@@ -432,10 +577,10 @@ cmd_uninstall() {
 
 # --- get_router_id из файла ---
 get_router_id() {
-    if [ -f /etc/netwatch/router_id ]; then
-        cat /etc/netwatch/router_id
-    elif [ -f /etc/netwatch/config ] && grep -q '^ROUTER_ID=' /etc/netwatch/config; then
-        grep '^ROUTER_ID=' /etc/netwatch/config | cut -d'=' -f2- | sed 's/^"//; s/"$//'
+    if [ -n "${ROUTER_ID:-}" ]; then
+        printf '%s' "$ROUTER_ID"
+    elif [ -f /etc/netwatch/router_id ]; then
+        tr -d '\r\n' < /etc/netwatch/router_id
     fi
 }
 

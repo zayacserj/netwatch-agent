@@ -11,6 +11,7 @@ import json
 import time
 import sqlite3
 import secrets
+import re
 import asyncio
 from pathlib import Path
 
@@ -240,6 +241,16 @@ async def get_agent_script(request):
         return web.Response(text="# Agent script not found", status=404)
     return web.Response(text=AGENT_SCRIPT_PATH.read_text(), content_type="application/x-sh")
 
+async def get_agent_identity(request):
+    """Identify this secret without exposing another user's routers or secrets."""
+    secret = request.headers.get("X-Agent-Secret")
+    with db_session() as conn:
+        row = conn.execute("SELECT router_id FROM router_secrets WHERE secret=?", (secret,)).fetchone()
+    if row is None:
+        return web.json_response({"error": "Invalid agent secret"}, status=403)
+    return web.json_response({"router_id": row["router_id"]})
+
+
 # --- POST /pair (регистрация роутера по pairing коду) ---
 async def post_pair(request):
     try:
@@ -247,40 +258,47 @@ async def post_pair(request):
     except json.JSONDecodeError:
         return web.json_response({"error": "Bad JSON"}, status=400)
 
+    if not isinstance(data, dict):
+        return web.json_response({"error": "Expected JSON object"}, status=400)
+
     code = data.get("code")
     router_id = data.get("router_id")
-    mac = data.get("mac", "unknown")
+    mac = data.get("mac")
     name = data.get("name", "OpenWrt Router")
     model = data.get("model", "unknown")
 
-    if not code or not router_id:
-        return web.json_response({"error": "Missing fields: code, router_id"}, status=400)
+    if (not isinstance(code, str) or not 0 < len(code) <= 128
+            or not isinstance(router_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", router_id)):
+        return web.json_response({"error": "Invalid code or router_id"}, status=400)
+    if any(value is not None and (not isinstance(value, str) or len(value) > 255)
+           for value in (name, model)):
+        return web.json_response({"error": "Invalid router metadata"}, status=400)
+    if mac == "unknown":
+        mac = None
+    if mac is not None:
+        if not isinstance(mac, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", mac):
+            return web.json_response({"error": "Invalid router MAC"}, status=400)
+        mac = mac.lower()
 
-    pc = get_pairing_code(code)
-    if not pc:
-        return web.json_response({"error": "Invalid or expired pairing code"}, status=403)
-
-    chat_id = pc["chat_id"]
-    consume_pairing_code(code, router_id)
-
-    # Регистрируем роутер (обновляем router_id на случай если MAC уже существует)
-    router_id = upsert_router(router_id, chat_id, name=name, mac=mac, model=model)
-
-    # Генерируем уникальный секрет для этого роутера
-    router_secret = secrets.token_hex(16)
-
-    # Сохраняем секрет в конфиге (для последующих запросов)
+    # One writer claims the code, resolves the router and stores its secret.
+    # A failed commit must not consume the code or leave a partial registration.
     with db_session() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS router_secrets (
-                router_id TEXT PRIMARY KEY,
-                secret TEXT NOT NULL,
-                FOREIGN KEY (router_id) REFERENCES routers(router_id)
-            )
-        """)
+        conn.execute("BEGIN IMMEDIATE")
+        pc = conn.execute("""SELECT chat_id FROM pairing_codes
+            WHERE code=? AND used=0 AND expires_at>?""", (code, int(time.time()))).fetchone()
+        if pc is None:
+            return web.json_response({"error": "Invalid or expired pairing code"}, status=403)
+        chat_id = pc["chat_id"]
+        owner = conn.execute("SELECT chat_id FROM routers WHERE router_id=?", (router_id,)).fetchone()
+        if owner is not None and owner["chat_id"] != chat_id:
+            return web.json_response({"error": "Router belongs to another user"}, status=409)
+
+        router_id = upsert_router(router_id, chat_id, name=name, mac=mac, model=model, conn=conn)
+        router_secret = secrets.token_hex(16)
         conn.execute("""
             INSERT OR REPLACE INTO router_secrets (router_id, secret) VALUES (?, ?)
         """, (router_id, router_secret))
+        conn.execute("UPDATE pairing_codes SET used=1, router_id=? WHERE code=?", (router_id, code))
 
     return web.json_response({
         "status": "paired",
@@ -360,6 +378,7 @@ def create_app():
     app.router.add_post("/devices", post_devices)
     app.router.add_post("/health", post_health)
     app.router.add_get("/agent.sh", get_agent_script)
+    app.router.add_get("/agent/identity", get_agent_identity)
     app.router.add_post("/pair", post_pair)
 
     # Start background task for offline device checking (after event loop starts)

@@ -221,7 +221,8 @@ async def post_health(request):
               1 if data["internet"] else 0,
               1 if data["wifi"] else 0,
               data["cpu"], data["ram"], data["wifi_clients"],
-              data["podkop_status"], 1 if data["podkop_test"] else 0,
+              data["podkop_status"],
+              None if data["podkop_test"] is None else (1 if data["podkop_test"] else 0),
               timestamp))
 
         # Обновляем last_seen роутера

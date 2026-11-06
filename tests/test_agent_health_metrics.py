@@ -26,7 +26,7 @@ class HealthMetrics(unittest.TestCase):
         self.mem.write_text('MemTotal: 524288 kB\nMemAvailable: 393216 kB\nMemFree: 100000 kB\n')
         source = AGENT.read_text(encoding='utf-8')
         start = source.index('cmd_run() {')
-        end = source.index('    # Состояние Podkop', start)
+        end = source.index('    # Экранируем строковые значения', start)
         collection = source[start:end] + '}\n'
         collection = collection.replace('/proc/stat', self.stat.as_posix())
         collection = collection.replace('/proc/meminfo', self.mem.as_posix())
@@ -45,15 +45,21 @@ iwinfo() {
     esac
 }
 sleep() { cp "$STAT_AFTER" "$STAT_FILE"; }
+podkop() {
+    [ "$1" = get_sing_box_status ] || return 99
+    printf '%s' "$PODKOP_JSON"
+    return "${PODKOP_EXIT:-0}"
+}
 capture() {
     jq -cn --arg cpu "$cpu" --arg ram "$ram" --argjson wifi "$wifi_status" \\
-       --argjson clients "$wifi_clients" '{cpu:$cpu,ram:$ram,wifi:$wifi,clients:$clients}'
+       --argjson clients "$wifi_clients" --arg podkop "$podkop_status" --argjson probe "$podkop_test" \\
+       '{cpu:$cpu,ram:$ram,wifi:$wifi,clients:$clients,podkop:$podkop,probe:$probe}'
 }
 ''' + collection.replace('\n}\n', '\n    capture\n}\n') + '\ncmd_run\n',
                                encoding='utf-8', newline='\n')
         self.env = dict(os.environ, STAT_AFTER=self.after.as_posix(), STAT_FILE=self.stat.as_posix(),
                         WIRELESS='phy#0\n Interface phy0-ap0\n type AP\nphy#1\n Interface phy1-ap0\n type AP',
-                        ASSOC0='', ASSOC1='', RADIO_FAIL='0')
+                        ASSOC0='', ASSOC1='', RADIO_FAIL='0', PODKOP_JSON='{"running":1,"enabled":0}', PODKOP_EXIT='0')
 
     def run_health(self, **env):
         command = [SHELL, 'sh'] if 'busybox' in Path(SHELL).name.lower() else [SHELL]
@@ -118,3 +124,20 @@ capture() {
         result = self.run_health(RADIO_FAIL='1')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '')
+
+    def test_podkop_running_with_disabled_autostart_is_not_stopped(self):
+        values = self.metrics()
+        self.assertEqual(values['podkop'], 'running')
+        self.assertIsNone(values['probe'])
+
+    def test_podkop_stopped_is_explicit(self):
+        self.assertEqual(self.metrics(PODKOP_JSON='{"running":0,"enabled":1}')['podkop'], 'stopped')
+
+    def test_podkop_failed_command_reports_unknown(self):
+        self.assertEqual(self.metrics(PODKOP_EXIT='1')['podkop'], 'unknown')
+
+    def test_podkop_invalid_response_reports_unknown(self):
+        self.assertEqual(self.metrics(PODKOP_JSON='unsupported command')['podkop'], 'unknown')
+
+    def test_podkop_missing_runtime_field_reports_unknown(self):
+        self.assertEqual(self.metrics(PODKOP_JSON='{"enabled":1}')['podkop'], 'unknown')

@@ -222,6 +222,15 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.count('health_checks'), 1)
         self.assertTrue(all(c.closed for c in self.connections))
 
+    def test_health_preserves_unknown_proxy_test(self):
+        self.run_handler('post_health', dict(router_id='r', internet=True, wifi=True,
+                         cpu='13.7%', ram='192MiB/485MiB', wifi_clients=6,
+                         podkop_status='running', podkop_test=None))
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute('SELECT podkop_status, podkop_test FROM health_checks').fetchone(),
+                             ('running', None))
+        self.assertTrue(all(c.closed for c in self.connections))
+
     def test_pair_and_auth(self):
         db.create_pairing_code('code', 1)
         result = self.run_handler('post_pair', dict(code='code', router_id='r'))

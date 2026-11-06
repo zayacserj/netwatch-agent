@@ -448,12 +448,18 @@ async def cmd_health(message: Message):
         if h:
             net = "✅" if h["internet"] else "❌"
             wf = "✅" if h["wifi"] else "❌"
-            pk = "✅" if h["podkop_test"] else "⚠️"
+            pk = "не проверялся" if h["podkop_test"] is None else ("✅" if h["podkop_test"] else "⚠️")
+            podkop_status = {
+                "running": "sing-box работает",
+                "stopped": "sing-box остановлен",
+                "not_installed": "не установлен",
+                "unknown": "неизвестно",
+            }.get(h["podkop_status"], h["podkop_status"] or "н/д")
             lines.append(
                 f"• {r['name'] or r['router_id']}:\n"
-                f"  Интернет: {net} | Wi-Fi: {wf} | CPU: {h['cpu'] or 'н/д'} | "
-                f"RAM: {h['ram'] or 'н/д'} | Клиенты: {h['wifi_clients']}\n"
-                f"  Podkop: {h['podkop_status'] or 'н/д'} (test: {pk})"
+                f"  Интернет: {net} | Wi-Fi: {wf} (клиентов: {h['wifi_clients']}) | CPU: {h['cpu'] or 'н/д'} | "
+                f"RAM: {h['ram'] or 'н/д'}\n"
+                f"  Podkop: {podkop_status} | Прокси: {pk}"
             )
         else:
             lines.append(f"• {r['name'] or r['router_id']}: ⏳ нет данных о health-check")

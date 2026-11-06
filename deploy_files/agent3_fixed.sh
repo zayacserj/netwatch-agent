@@ -195,7 +195,7 @@ cmd_run() {
     local ram=""
     local wifi_clients=0
     local podkop_status="unknown"
-    local podkop_test=0
+    local podkop_test=null
 
     # Проверка интернета
     if ping -c 1 -W 3 8.8.8.8 > /dev/null 2>&1; then
@@ -263,18 +263,19 @@ $(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
     ' /proc/meminfo) || return 1
 
 
-    # Состояние Podkop (если установлен)
+    # Podkop 0.7.x exposes sing-box runtime state separately from autostart.
+    # Connectivity/latency is not tested by this command: keep it unknown.
     if command -v podkop > /dev/null 2>&1; then
-        if podkop status > /dev/null 2>&1; then
-            podkop_status="running"
-        else
-            podkop_status="stopped"
+        local podkop_json
+        if podkop_json=$(podkop get_sing_box_status 2>/dev/null); then
+            podkop_status=$(printf '%s' "$podkop_json" | jq -er '
+                if .running == 1 or .running == true then "running"
+                elif .running == 0 or .running == false then "stopped"
+                else empty end
+            ' 2>/dev/null) || podkop_status="unknown"
         fi
-        if podkop test > /dev/null 2>&1; then
-            podkop_test=1
-        else
-            podkop_test=0
-        fi
+    else
+        podkop_status="not_installed"
     fi
 
     # Экранируем строковые значения для JSON

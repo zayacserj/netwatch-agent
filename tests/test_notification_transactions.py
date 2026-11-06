@@ -258,6 +258,122 @@ class Transactions(unittest.TestCase):
         self.assertFalse(self.connections[-1].rolled_back)
         self.assertTrue(self.connections[-1].closed)
 
+    def test_snapshot_reconnect_notifies_once_and_preserves_name(self):
+        self.seed_device(online=0)
+        db.mark_device_notified(1, 'aa', 'r', notification_state=0)
+        data = dict(router_id='r', devices=[{'mac': 'AA'}, {'mac': 'aa'}])
+        result = self.run_handler('post_devices', data)
+        self.assertEqual(json.loads(result.text)['new_devices'], [])
+        self.assertEqual(self.sent, [(1, '🟢 Устройство онлайн: `aa` — My device')])
+        self.assertEqual(self.online(), 1)
+        self.assertEqual(db.get_device(1, 'aa', 'r')['custom_name'], 'My device')
+        self.run_handler('post_devices', data)
+        self.run_handler('post_event', dict(router_id='r', mac='aa', event='CONNECTED'))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_snapshot_reconnect_without_watch_updates_silently(self):
+        self.seed_device(online=0, watch=0)
+        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        self.assertEqual(self.online(), 1)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.count('device_notifications'), 0)
+
+    def test_snapshot_already_online_is_silent(self):
+        self.seed_device()
+        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        self.assertEqual(self.sent, [])
+
+    def test_connected_event_respects_disabled_notifications(self):
+        self.seed_device(online=0, watch=0)
+        self.run_handler('post_event', dict(router_id='r', mac='aa', event='CONNECTED'))
+        self.assertEqual(self.online(), 1)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.count('device_notifications'), 0)
+
+    def test_opposite_transitions_are_not_suppressed_by_recent_notification(self):
+        self.seed_device()
+        self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
+        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
+        self.run_handler('post_event', dict(router_id='r', mac='aa', event='CONNECTED'))
+        self.assertEqual(len(self.sent), 4)
+        self.assertTrue(self.sent[0][1].startswith('🔴'))
+        self.assertTrue(self.sent[1][1].startswith('🟢'))
+        self.assertTrue(self.sent[2][1].startswith('🔴'))
+        self.assertTrue(self.sent[3][1].startswith('🟢'))
+
+    def test_same_state_and_legacy_notification_cooldown_preserved(self):
+        self.seed_device()
+        db.mark_device_notified(1, 'aa', 'r', notification_state=1)
+        self.assertFalse(db.can_notify_device(1, 'aa', 'r', notification_state=1))
+        self.assertTrue(db.can_notify_device(1, 'aa', 'r', notification_state=0))
+        self.assertFalse(db.can_notify_device(1, 'aa', 'r'))
+        with patch.object(db.time, 'time', return_value=db.time.time() + 301):
+            self.assertTrue(db.can_notify_device(1, 'aa', 'r', notification_state=1))
+
+    def test_snapshot_reconnect_commit_failure_keeps_offline_and_marker(self):
+        self.seed_device(online=0)
+        db.mark_device_notified(1, 'aa', 'r', notification_state=0)
+        self.fail_commit = True
+        with self.assertRaises(sqlite3.OperationalError):
+            self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        self.assertEqual(self.online(), 0)
+        self.assertEqual(self.sent, [])
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute('SELECT last_notified_state FROM device_notifications').fetchone()[0], 0)
+        self.assertTrue(self.connections[-1].rolled_back)
+        self.assertTrue(self.connections[-1].closed)
+
+    def test_snapshot_reconnect_send_failure_keeps_committed_state(self):
+        self.seed_device(online=0)
+        db.mark_device_notified(1, 'aa', 'r', notification_state=0)
+        with patch.object(api, 'send_telegram_notification', side_effect=RuntimeError('network')):
+            with self.assertRaises(RuntimeError):
+                self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        self.assertEqual(self.online(), 1)
+        self.assertTrue(self.connections[-1].closed)
+        self.assertFalse(self.connections[-1].rolled_back)
+
+    def test_timeout_without_watch_updates_status_without_notification(self):
+        self.seed_device(watch=0)
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.offline()
+        self.assertEqual(self.online(), 0)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.count('device_notifications'), 0)
+
+    def test_timeout_then_snapshot_reconnect_notifies_both_directions(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.offline()
+        self.assertEqual(self.online(), 0)
+        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        self.assertEqual(self.online(), 1)
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(self.sent[0][1].startswith('🔴'))
+        self.assertTrue(self.sent[1][1].startswith('🟢'))
+
+    def test_notification_migration_preserves_legacy_data_and_is_repeatable(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute('DROP TABLE device_notifications')
+            conn.execute('''CREATE TABLE device_notifications (
+                chat_id INTEGER, mac TEXT, router_id TEXT, last_notified_at INTEGER,
+                PRIMARY KEY(chat_id, mac, router_id),
+                FOREIGN KEY(chat_id) REFERENCES users(chat_id),
+                FOREIGN KEY(mac, router_id) REFERENCES devices(mac, router_id))''')
+            conn.execute("INSERT INTO device_notifications VALUES (1,'aa','r',?)", (int(db.time.time()),))
+        db.init_db()
+        db.init_db()
+        with closing(sqlite3.connect(self.path)) as conn:
+            row = conn.execute('SELECT chat_id, mac, router_id, last_notified_state FROM device_notifications').fetchone()
+        self.assertEqual(row, (1, 'aa', 'r', None))
+        self.assertFalse(db.can_notify_device(1, 'aa', 'r', notification_state=1))
+        db.mark_device_notified(1, 'aa', 'r', notification_state=0)
+        self.assertTrue(db.can_notify_device(1, 'aa', 'r', notification_state=1))
+
     def offline(self):
         async def stop(_):
             raise asyncio.CancelledError

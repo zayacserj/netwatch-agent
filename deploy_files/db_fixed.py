@@ -126,6 +126,7 @@ def init_db():
             mac TEXT,
             router_id TEXT,
             last_notified_at INTEGER DEFAULT (unixepoch()),
+            last_notified_state INTEGER,
             PRIMARY KEY (chat_id, mac, router_id),
             FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
             FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
@@ -139,6 +140,9 @@ def init_db():
             conn.execute("ALTER TABLE devices ADD COLUMN custom_name TEXT")
         if "watch_online" not in columns:
             conn.execute("ALTER TABLE devices ADD COLUMN watch_online INTEGER DEFAULT 1")
+        notification_columns = [col["name"] for col in conn.execute("PRAGMA table_info(device_notifications)").fetchall()]
+        if "last_notified_state" not in notification_columns:
+            conn.execute("ALTER TABLE device_notifications ADD COLUMN last_notified_state INTEGER")
         # Проверяем наличие таблицы device_notifications
         tables = [row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
         if "device_notifications" not in tables:
@@ -491,25 +495,29 @@ def is_valid_router_secret(secret):
         return row is not None
 
 
-def can_notify_device(chat_id, mac, router_id, min_interval=300, conn=None):
+def can_notify_device(chat_id, mac, router_id, min_interval=300, conn=None, notification_state=None):
     """Check if we can send a notification for this device (deduplication)"""
     with db_session(conn) as conn:
         now = int(time.time())
         row = conn.execute(
-            "SELECT last_notified_at FROM device_notifications WHERE chat_id=? AND mac=? AND router_id=?",
+            "SELECT last_notified_at, last_notified_state FROM device_notifications WHERE chat_id=? AND mac=? AND router_id=?",
             (chat_id, mac, router_id)
         ).fetchone()
         if not row:
+            return True
+        # An opposite status is a new transition, not a duplicate notification.
+        if (notification_state is not None and row["last_notified_state"] is not None
+                and notification_state != row["last_notified_state"]):
             return True
         last_notified_at = row["last_notified_at"]
         return (now - last_notified_at) >= min_interval
 
 
-def mark_device_notified(chat_id, mac, router_id, conn=None):
+def mark_device_notified(chat_id, mac, router_id, conn=None, notification_state=None):
     """Mark that we've sent a notification for this device"""
     with db_session(conn) as conn:
         now = int(time.time())
         conn.execute(
-            "INSERT OR REPLACE INTO device_notifications (chat_id, mac, router_id, last_notified_at) VALUES (?, ?, ?, ?)",
-            (chat_id, mac, router_id, now)
+            "INSERT OR REPLACE INTO device_notifications (chat_id, mac, router_id, last_notified_at, last_notified_state) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, mac, router_id, now, notification_state)
         )

@@ -88,11 +88,12 @@ async def cmd_start(message: Message):
 
 # --- /add_router ---
 def _agent_install_command(code, url):
+    from ipaddress import ip_address
     from shlex import quote
     from urllib.parse import urlsplit
 
-    release_ref = "d8b0aa40bb48a51cab4657240cac4567cded8940"
-    agent_sha256 = "855c75293d81a707e5c3eea5a90bfb757d8bbe5fef84973f5187c4e53b592ca1"
+    release_ref = "0ede2c802ccdee358fd961cf571e9a4d9c9c5d09"
+    agent_sha256 = "f922ad67d45c8df779bac4a58b885622207ca1a80a4da3e93701f7d8219af697"
     if (not isinstance(code, str) or len(code) != 8
             or any(c not in "0123456789abcdefABCDEF" for c in code)):
         raise ValueError("Invalid pairing code")
@@ -102,10 +103,18 @@ def _agent_install_command(code, url):
         raise ValueError("Invalid API address")
     url = url.rstrip("/")
     parts = urlsplit(url)
-    if (parts.scheme not in ("http", "https") or not parts.hostname
+    if (parts.scheme != "https" or not parts.hostname
             or parts.username is not None or parts.password is not None
             or parts.query or parts.fragment):
         raise ValueError("Invalid API address")
+    try:
+        ip_address(parts.hostname)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("Use the canonical API hostname, not an IP address")
+    if parts.hostname.lower() == "localhost" or parts.hostname.lower().endswith((".local", ".localhost")):
+        raise ValueError("Use the public API hostname")
     if parts.port is not None and not 1 <= parts.port <= 65535:
         raise ValueError("Invalid API port")
     source = f"https://raw.githubusercontent.com/zayacserj/netwatch-agent/{release_ref}/deploy_files/agent3_fixed.sh"
@@ -127,30 +136,19 @@ def _agent_install_command(code, url):
 async def cmd_add_router(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     code = secrets.token_hex(4)
-    pi_url = os.getenv("PI_URL", "http://192.168.10.222:8080")
-    pi_url_public = os.getenv("PI_URL_PUBLIC", "")
+    api_url = os.getenv("PI_URL_PUBLIC", "")
     try:
-        local_command = _agent_install_command(code, pi_url)
+        install_command = _agent_install_command(code, api_url)
     except ValueError:
-        await message.reply("Не удалось подготовить подключение: проверьте адрес сервера NetWatch.")
+        await message.reply("Подключение временно недоступно: единый HTTPS-адрес сервера NetWatch не настроен.")
         return
 
     text = (
         f"🔐 Код подключения роутера: `{code}`\n"
         "Действует 15 минут. Выполните весь блок от root на OpenWrt.\n"
         "Нужны curl, jq, iw и iwinfo; отсутствующие пакеты автоматически не устанавливаются.\n\n"
-        f"🏠 Роутер в одной сети с сервером:\n```\n{local_command}\n```\n"
+        f"🌐 Установка на OpenWrt — одинаковая для домашней сети и интернета:\n```\n{install_command}\n```\n"
     )
-    public_command = None
-    if pi_url_public.startswith("https://"):
-        try:
-            public_command = _agent_install_command(code, pi_url_public)
-        except ValueError:
-            pass
-    if public_command:
-        text += f"\n🌐 Роутер в другой сети:\n```\n{public_command}\n```\n"
-    else:
-        text += "\nДля подключения из другой сети нужен настроенный публичный HTTPS-адрес сервера.\n"
     text += "\nСуществующая рабочая привязка и задания других программ сохраняются."
     create_pairing_code(code, message.from_user.id, expires_sec=900)
     await message.reply(text, parse_mode="Markdown")

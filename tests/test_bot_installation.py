@@ -43,13 +43,13 @@ class BotInstallation(unittest.TestCase):
         self.message = SimpleNamespace(from_user=SimpleNamespace(id=1, username='test', first_name='Test'),
                                        reply=reply)
 
-    def render(self, local='http://192.168.10.222:8080', public=''):
-        with patch.dict(os.environ, PI_URL=local, PI_URL_PUBLIC=public):
+    def render(self, url='https://netwatchagent.example', legacy='http://192.168.10.222:8080'):
+        with patch.dict(os.environ, PI_URL=legacy, PI_URL_PUBLIC=url):
             asyncio.run(self.handler(self.message))
         return self.replies[-1]
 
     def test_command_pins_an_immutable_release_and_its_actual_checksum(self):
-        command = self.command('11223344', 'http://pi.invalid:8080')
+        command = self.command('11223344', 'https://pi.invalid:8080')
         self.assertRegex(command, r'/[0-9a-f]{40}/deploy_files/agent3_fixed\.sh')
         self.assertNotIn('/master/', command)
         self.assertNotIn('/main/', command)
@@ -62,36 +62,52 @@ class BotInstallation(unittest.TestCase):
         self.assertNotIn('opkg ', command)
         self.assertNotIn('apk ', command)
 
-    def test_local_command_is_rendered_as_copyable_code(self):
+    def test_universal_command_is_rendered_as_copyable_code(self):
         text, kwargs = self.render()
         self.assertEqual(kwargs['parse_mode'], 'Markdown')
         self.assertIn('```\n(\n', text)
         self.assertEqual(len(self.codes), 1)
         self.assertEqual(self.codes[0], (('11223344', 1), {'expires_sec': 900}))
+        self.assertEqual(text.count('pair --code 11223344'), 1)
+        self.assertNotIn('192.168.10.222', text)
 
-    def test_external_command_requires_configured_https(self):
-        text, _ = self.render(public='https://api.example.invalid')
+    def test_single_canonical_command_ignores_legacy_local_address(self):
+        text, _ = self.render(url='https://api.example.invalid', legacy='http://10.0.0.10:8080')
         self.assertIn('--url https://api.example.invalid', text)
         self.assertLessEqual(len(text), 4096)
         self.assertEqual(len(self.codes), 1)
-        self.assertEqual(text.count('pair --code 11223344'), 2)
+        self.assertEqual(text.count('pair --code 11223344'), 1)
+        other, _ = self.render(url='https://api.example.invalid', legacy='http://192.168.99.99:8080')
+        self.assertEqual(text, other)
 
     def test_old_public_http_default_is_not_offered(self):
-        text, _ = self.render(public='http://95.31.29.233:8080')
+        text, _ = self.render(url='http://95.31.29.233:8080')
         self.assertNotIn('95.31.29.233', text)
-        self.assertIn('публичный HTTPS-адрес', text)
+        self.assertIn('единый HTTPS-адрес', text)
+        self.assertEqual(self.codes, [])
 
-    def test_invalid_local_address_does_not_issue_code_or_expose_credentials(self):
-        text, _ = self.render(local='http://admin:private-password@pi.invalid')
+    def test_invalid_address_does_not_issue_code_or_expose_credentials(self):
+        text, _ = self.render(url='https://admin:private-password@pi.invalid')
         self.assertEqual(self.codes, [])
         self.assertNotIn('private-password', text)
+
+    def test_missing_canonical_address_never_falls_back_to_lan(self):
+        text, _ = self.render(url='')
+        self.assertEqual(self.codes, [])
+        self.assertNotIn('192.168.10.222', text)
+
+    def test_ip_literals_and_localhost_cannot_be_canonical_host(self):
+        for url in ('https://192.168.10.222', 'https://95.31.29.233', 'https://localhost',
+                    'https://[::1]', 'https://netwatch.local', 'http://public.example'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                self.command('11223344', url)
 
     def test_invalid_codes_and_urls_are_rejected(self):
         for code in ('', 'not-code', '1122;344'):
             with self.subTest(code=code), self.assertRaises(ValueError):
-                self.command(code, 'http://pi.invalid')
-        for url in ('file:///tmp/agent.sh', 'http://pi.invalid?x=1', 'http://pi.invalid#x',
-                    'http://pi.invalid:invalid', 'http://pi.invalid\ncommand'):
+                self.command(code, 'https://pi.invalid')
+        for url in ('file:///tmp/agent.sh', 'https://pi.invalid?x=1', 'https://pi.invalid#x',
+                    'https://pi.invalid:invalid', 'https://pi.invalid\ncommand'):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 self.command('11223344', url)
 
@@ -100,7 +116,7 @@ class BotInstallation(unittest.TestCase):
             self.skipTest('shell bootstrap checks require sh')
         return [SHELL, 'sh'] if 'busybox' in Path(SHELL).name.lower() else [SHELL]
 
-    def bootstrap(self, artifact, *, correct_hash=True, curl_exit='0', url='http://pi.invalid:8080'):
+    def bootstrap(self, artifact, *, correct_hash=True, curl_exit='0', url='https://pi.invalid:8080'):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as name:
             folder = Path(name)
             download = folder / 'artifact.sh'
@@ -131,7 +147,7 @@ class BotInstallation(unittest.TestCase):
             return result, args
 
     def test_bootstrap_passes_code_and_url_without_shell_interpretation(self):
-        url = 'http://pi.invalid/path;literal'
+        url = 'https://pi.invalid/path;literal'
         result, args = self.bootstrap('printf "%s\\n" "$@" > "$PAIR_MARKER"\n', url=url)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(args, ['pair', '--code', '11223344', '--url', url])
@@ -156,7 +172,7 @@ class BotInstallation(unittest.TestCase):
         fixture = Installation()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
-        command = self.command('11223344', 'http://pi.invalid:8080')
+        command = self.command('11223344', 'https://pi.invalid:8080')
         # The harness adds fake radio/HTTP functions to the real release script.
         command = re.sub(r'(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])',
                          hashlib.sha256(fixture.agent.read_bytes()).hexdigest(), command)

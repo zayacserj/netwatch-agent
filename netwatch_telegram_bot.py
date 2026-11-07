@@ -300,37 +300,72 @@ async def callback_cancel_delete(callback: CallbackQuery):
 
 
 # --- /devices ---
+DEVICES_PER_PAGE = 10
+
+
+def unique_devices(rows):
+    """Prefer the most recently seen online record for each MAC."""
+    ordered = sorted(rows, key=lambda row: (
+        not row["online"], -(row["last_seen"] or 0), row["router_id"],
+    ))
+    selected = {}
+    for row in ordered:
+        selected.setdefault(row["mac"].lower(), row)
+    return list(selected.values())
+
+
+def render_devices_page(chat_id, page=0):
+    devices = unique_devices(get_user_devices(chat_id))
+    if not devices:
+        return "📭 Нет Wi-Fi устройств.", None
+
+    pages = (len(devices) + DEVICES_PER_PAGE - 1) // DEVICES_PER_PAGE
+    page = max(0, min(page, pages - 1))
+    start = page * DEVICES_PER_PAGE
+    lines = [f"📱 Мои Wi-Fi устройства · {len(devices)}", f"Страница {page + 1} из {pages}", ""]
+    builder = InlineKeyboardBuilder()
+    for device in devices[start:start + DEVICES_PER_PAGE]:
+        mac = device["mac"]
+        router_id = device["router_id"]
+        name = " ".join((device["custom_name"] or device["hostname"] or mac).split())[:64] or mac
+        router_name = " ".join((device["router_name"] or router_id).split())[:64]
+        status = "🟢" if device["online"] else "🔴"
+        bell = "🔔" if device.get("watch_online", 1) else "🔕"
+        lines.append(f"{status} {name} · {router_name}\n   {mac}")
+        data = f"device_detail|{mac}|{router_id}"
+        if len(data.encode("utf-8")) <= 64:
+            builder.button(text=f"{status} {name} {bell}", callback_data=data)
+    builder.adjust(1)
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"device_page|{page - 1}"))
+    if page + 1 < pages:
+        navigation.append(InlineKeyboardButton(text="Далее ▶", callback_data=f"device_page|{page + 1}"))
+    if navigation:
+        builder.row(*navigation)
+    return "\n".join(lines), builder.as_markup()
+
+
 @dp.message(Command("devices"))
 async def cmd_devices(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    routers = get_user_routers(message.from_user.id)
-    if not routers:
+    text, markup = render_devices_page(message.from_user.id)
+    if markup is None and not get_user_routers(message.from_user.id):
         await message.reply("📭 У вас нет роутеров. Добавьте: /add_router")
         return
-    builder = InlineKeyboardBuilder()
-    lines = ["📱 *Мои Wi-Fi устройства:*"]
-    seen_macs = set()
-    for r in routers:
-        router_name = r["name"] or r["router_id"]
-        devs = get_user_devices(message.from_user.id, r["router_id"])
-        if not devs:
-            lines.append(f"\n🔹 *{router_name}:* — устройств нет")
-            continue
-        lines.append(f"\n🔹 *{router_name}:*")
-        for d in devs:
-            mac_key = d["mac"].lower()
-            if mac_key in seen_macs:
-                continue
-            seen_macs.add(mac_key)
-            status = "🟢" if d["online"] else "🔴"
-            name = d["custom_name"] or d["hostname"] or "неизвестно"
-            lines.append(f"{status} `{d['mac']}` — {name}")
-            builder.button(
-                text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
-                callback_data=f"device_detail|{d['mac']}|{r['router_id']}"
-            )
-    builder.adjust(1)
-    await message.reply("\n".join(lines), reply_markup=builder.as_markup())
+    await message.reply(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("device_page|"))
+async def callback_device_page(callback: CallbackQuery):
+    try:
+        page = int(callback.data.split("|", 1)[1])
+    except ValueError:
+        await callback.answer("Страница недоступна")
+        return
+    text, markup = render_devices_page(callback.from_user.id, page)
+    await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
 
 
 # --- Device detail callback ---
@@ -372,24 +407,8 @@ async def callback_device_detail(callback: CallbackQuery):
 # --- Device back to list ---
 @dp.callback_query(F.data == "device_back_list")
 async def callback_device_back(callback: CallbackQuery):
-    devices = get_user_devices(callback.from_user.id)
-    if not devices:
-        await callback.message.edit_text("📭 Нет Wi-Fi устройств.")
-        await callback.answer()
-        return
-    builder = InlineKeyboardBuilder()
-    lines = ["📱 *Мои Wi-Fi устройства:*"]
-    for d in devices:
-        status = "🟢" if d["online"] else "🔴"
-        name = d["custom_name"] or d["hostname"] or "неизвестно"
-        router_name = d.get("router_name", "н/д")
-        lines.append(f"{status} `{d['mac']}` — {name} ({router_name})")
-        builder.button(
-            text=f"{status} {name or d['mac']} ({d['mac']}) [{router_name}]{' 🔔' if d.get('watch_online', 1) else ' 🔕'}",
-            callback_data=f"device_detail|{d['mac']}|{d['router_id']}"
-        )
-    builder.adjust(1)
-    await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
+    text, markup = render_devices_page(callback.from_user.id)
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
 
 

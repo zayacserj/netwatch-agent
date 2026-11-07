@@ -161,7 +161,7 @@ def mount_uuid(mount):
     return output.stdout.strip().lower() if output.returncode == 0 else ""
 
 
-def encrypted_usb_copy(archive, mount, uuid, recipient):
+def copy_to_usb(archive, mount, uuid):
     if mount_uuid(mount) != uuid.lower():
         return False
     fd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -176,18 +176,16 @@ def encrypted_usb_copy(archive, mount, uuid, recipient):
         target = os.open("netwatch-backups", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         try:
             temporary = f".partial-{secrets.token_hex(8)}"
-            output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=target)
+            output = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=target)
             try:
-                with os.fdopen(output, "wb") as stream:
-                    subprocess.run(
-                        ["age", "--encrypt", "--recipient", recipient, str(archive)],
-                        stdout=stream, check=True, timeout=600,
-                    )
+                with os.fdopen(output, "w+b") as stream, archive.open("rb") as source:
+                    expected = digest(source, stream)
                     stream.flush()
-                    if stream.tell() == 0:
-                        raise RuntimeError("Encrypted USB archive is empty")
                     os.fsync(stream.fileno())
-                os.replace(temporary, archive.name + ".age", src_dir_fd=target, dst_dir_fd=target)
+                    stream.seek(0)
+                    if digest(stream) != expected:
+                        raise RuntimeError("USB archive SHA-256 mismatch")
+                os.replace(temporary, archive.name, src_dir_fd=target, dst_dir_fd=target)
                 os.fsync(target)
             finally:
                 try:
@@ -225,14 +223,14 @@ def main():
 
     archive = create_archive(DESTINATION, live_files(), database_files())
     print(f"Локальный архив проверен: {archive}", flush=True)
-    usb = [os.getenv(key, "") for key in ("NETWATCH_USB_MOUNT", "NETWATCH_USB_UUID", "NETWATCH_AGE_RECIPIENT")]
+    usb = [os.getenv(key, "") for key in ("NETWATCH_USB_MOUNT", "NETWATCH_USB_UUID")]
     if any(usb):
-        if not all(usb) or not Path(usb[0]).is_absolute() or not usb[2].startswith("age1"):
+        if not all(usb) or not Path(usb[0]).is_absolute():
             raise RuntimeError("Incomplete USB backup configuration")
-        if not encrypted_usb_copy(archive, Path(usb[0]), usb[1], usb[2]):
+        if not copy_to_usb(archive, Path(usb[0]), usb[1]):
             print("USB-копия пропущена: настроенный носитель не смонтирован.", file=sys.stderr)
             return 2
-        print(f"Зашифрованная копия на USB: {archive.name}.age")
+        print(f"Копия на USB проверена по SHA-256: {archive.name}")
     prune(DESTINATION, int(os.getenv("NETWATCH_BACKUP_KEEP", "0")))
     return 0
 

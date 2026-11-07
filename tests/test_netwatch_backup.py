@@ -1,5 +1,6 @@
 from contextlib import closing
 import importlib.util
+import os
 from pathlib import Path
 import sqlite3
 import tarfile
@@ -46,9 +47,21 @@ class Backup(unittest.TestCase):
 
     def test_wrong_usb_is_not_written(self):
         with patch.object(backup, "mount_uuid", return_value="other-device"):
-            copied = backup.encrypted_usb_copy(self.root / "backup.tar.gz", self.root, "wanted", "age1-test")
+            copied = backup.copy_to_usb(self.root / "backup.tar.gz", self.root, "wanted")
         self.assertFalse(copied)
         self.assertFalse((self.root / "netwatch-backups").exists())
+
+    @unittest.skipUnless(os.name == "posix", "USB copy uses Linux directory descriptors")
+    def test_matching_usb_gets_the_verified_plain_archive(self):
+        archive = self.root / "backup.tar.gz"
+        archive.write_bytes(b"test archive")
+        mount = self.root / "usb"
+        mount.mkdir()
+        with patch.object(backup, "mount_uuid", return_value="wanted"):
+            self.assertTrue(backup.copy_to_usb(archive, mount, "WANTED"))
+        directory = mount / "netwatch-backups"
+        self.assertEqual([p.name for p in directory.iterdir()], [archive.name])
+        self.assertEqual((directory / archive.name).read_bytes(), archive.read_bytes())
 
     def test_rotation_does_not_delete_manual_backups(self):
         for filename in (

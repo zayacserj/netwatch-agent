@@ -17,6 +17,40 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 SHELL = os.environ.get('NETWATCH_TEST_SHELL') or shutil.which('sh')
 
+OPENWRT = '''id() { echo 0; }
+command() {
+    [ "$1" = -v ] || return 1
+    case "$2" in
+        apk|opkg) [ "$2" = "$MOCK_PACKAGE_MANAGER" ]; return ;;
+        curl|jq|iw|iwinfo)
+            case " $MOCK_MISSING " in
+                *" $2 "*) [ "$packages_installed" = yes ]; return ;;
+            esac ;;
+    esac
+    return 0
+}
+apk() {
+    echo "apk $*" >&2
+    if [ "$1" = add ]; then
+        [ "$MOCK_INSTALL_FAIL" != 1 ] || return 7
+        packages_installed=yes
+    fi
+}
+opkg() {
+    echo "opkg $*" >&2
+    if [ "$1" = install ]; then
+        [ "$MOCK_INSTALL_FAIL" != 1 ] || return 7
+        packages_installed=yes
+    fi
+}
+'''
+
+
+def mock_openwrt_paths(command, missing_ca=False):
+    return command.replace('/etc/openwrt_release', '"$ARTIFACT"').replace(
+        '/etc/ssl/certs/ca-certificates.crt', '"${ARTIFACT}.missing"' if missing_ca else '"$ARTIFACT"'
+    )
+
 
 class BotInstallation(unittest.TestCase):
     def setUp(self):
@@ -59,8 +93,6 @@ class BotInstallation(unittest.TestCase):
         self.assertIn('--fail', command)
         self.assertIn('--disable', command)
         self.assertNotIn(' -k ', command)
-        self.assertNotIn('opkg ', command)
-        self.assertNotIn('apk ', command)
 
     def test_universal_command_is_rendered_as_copyable_code(self):
         text, kwargs = self.render()
@@ -116,7 +148,8 @@ class BotInstallation(unittest.TestCase):
             self.skipTest('shell bootstrap checks require sh')
         return [SHELL, 'sh'] if 'busybox' in Path(SHELL).name.lower() else [SHELL]
 
-    def bootstrap(self, artifact, *, correct_hash=True, curl_exit='0', url='https://pi.invalid:8080'):
+    def bootstrap(self, artifact, *, correct_hash=True, curl_exit='0', url='https://pi.invalid:8080',
+                  package_manager='', missing='', missing_ca=False, install_fail=False):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as name:
             folder = Path(name)
             download = folder / 'artifact.sh'
@@ -136,9 +169,12 @@ class BotInstallation(unittest.TestCase):
     return 99
 }
 '''
-            result = subprocess.run(self.shell() + ['-c', mock + command], capture_output=True, text=True,
+            result = subprocess.run(self.shell() + ['-c', OPENWRT + mock + mock_openwrt_paths(command, missing_ca)],
+                                    capture_output=True, text=True,
                                     env=dict(os.environ, CURL_EXIT=curl_exit, ARTIFACT=download.as_posix(),
-                                             PAIR_MARKER=marker.as_posix()), timeout=15)
+                                             PAIR_MARKER=marker.as_posix(),
+                                             MOCK_PACKAGE_MANAGER=package_manager, MOCK_MISSING=missing,
+                                             MOCK_INSTALL_FAIL=str(int(install_fail))), timeout=15)
             args = marker.read_text().splitlines() if marker.exists() else None
             # Linux can unlink a script just executed by a child shell;
             # busybox-w32 may retain its handle until the parent unwinds.
@@ -151,6 +187,26 @@ class BotInstallation(unittest.TestCase):
         result, args = self.bootstrap('printf "%s\\n" "$@" > "$PAIR_MARKER"\n', url=url)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(args, ['pair', '--code', '11223344', '--url', url])
+        self.assertEqual(result.stderr, '')
+
+    def test_missing_tools_are_installed_before_pairing(self):
+        for manager, verb in (('apk', 'add'), ('opkg', 'install')):
+            for missing, missing_ca in (('curl jq iw iwinfo', True), ('jq', False), ('', False)):
+                with self.subTest(manager=manager, missing=missing):
+                    result, args = self.bootstrap('printf "%s\\n" "$@" > "$PAIR_MARKER"\n',
+                                                  package_manager=manager, missing=missing,
+                                                  missing_ca=missing_ca)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIsNotNone(args)
+                    packages = missing + (' ca-bundle' if missing_ca else '')
+                    expected = [f'{manager} update', f'{manager} {verb} {packages}'] if packages else []
+                    self.assertEqual(result.stderr.splitlines(), expected)
+
+    def test_package_failure_stops_before_pairing(self):
+        result, args = self.bootstrap('echo executed > "$PAIR_MARKER"\n',
+                                      package_manager='apk', missing='curl', install_fail=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNone(args)
 
     def test_checksum_mismatch_prevents_execution(self):
         result, args = self.bootstrap('echo executed > "$PAIR_MARKER"\n', correct_hash=False)
@@ -185,8 +241,10 @@ class BotInstallation(unittest.TestCase):
     return 99
 }
 '''
-        result = subprocess.run(self.shell() + ['-c', mock + command], capture_output=True, text=True,
-                                env=dict(fixture.env, ARTIFACT=fixture.agent.as_posix(), CANONICAL_ID='rt_from_server'),
+        result = subprocess.run(self.shell() + ['-c', OPENWRT + mock + mock_openwrt_paths(command)],
+                                capture_output=True, text=True,
+                                env=dict(fixture.env, ARTIFACT=fixture.agent.as_posix(),
+                                         CANONICAL_ID='rt_from_server', MOCK_PACKAGE_MANAGER=''),
                                 timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         fixture.assert_cron()

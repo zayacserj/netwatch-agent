@@ -1,0 +1,241 @@
+"""Create and verify NetWatch backups without stopping the running services."""
+import argparse
+from contextlib import closing
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+ROOT = Path("/opt/netwatch")
+DESTINATION = ROOT / "backups" / "scheduled"
+UNITS = ("netwatch-api", "netwatch-bot", "netwatch-monitor", "caddy")
+ARCHIVE_NAME = re.compile(r"netwatch-\d{8}T\d{12}Z-[a-f0-9]{8}\.tar\.gz")
+
+
+def live_files():
+    paths = [ROOT / name for name in (
+        "api.py", "db.py", "netwatch_telegram_bot.py", ".env", "agent3.sh",
+        "monitor/pi_monitor.py", "monitor/index.html", "monitor/dashboard.js",
+        "monitor/style.css", "ops/backup_netwatch.py",
+    )]
+    paths.append(Path("/etc/caddy/Caddyfile"))
+    for unit in UNITS:
+        output = subprocess.check_output([
+            "systemctl", "show", unit, "-p", "FragmentPath", "-p", "DropInPaths",
+        ], text=True, timeout=10)
+        props = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        if not props.get("FragmentPath"):
+            raise RuntimeError(f"No unit file for {unit}")
+        paths.append(Path(props["FragmentPath"]))
+        paths.extend(Path(path) for path in shlex.split(props.get("DropInPaths", "")))
+    for name in ("netwatch-backup.service", "netwatch-backup.timer"):
+        path = Path("/etc/systemd/system") / name
+        if path.is_file():
+            paths.append(path)
+    configuration = Path("/etc/netwatch-backup.conf")
+    if configuration.is_file():
+        paths.append(configuration)
+    return {str(path).lstrip("/"): path for path in paths}
+
+
+def database_files():
+    paths = {"opt/netwatch/netwatch.db": ROOT / "netwatch.db"}
+    legacy = ROOT / "netwatch_notify.db"
+    if legacy.is_file():
+        paths["opt/netwatch/netwatch_notify.db"] = legacy
+    return paths
+
+
+def sqlite_check(path):
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=30)) as conn:
+        if conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise RuntimeError(f"SQLite integrity check failed: {path.name}")
+
+
+def sqlite_backup(source, target):
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=30)) as src:
+        with closing(sqlite3.connect(target)) as dst:
+            src.backup(dst)
+    sqlite_check(target)
+
+
+def digest(stream, output=None):
+    sha = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        sha.update(chunk)
+        if output is not None:
+            output.write(chunk)
+    return sha.hexdigest()
+
+
+def verify_archive(path):
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        by_name = {item.name: item for item in members}
+        if len(by_name) != len(members) or any(not item.isfile() for item in members):
+            raise RuntimeError("Unexpected archive entries")
+        manifest = json.load(archive.extractfile("manifest.json"))
+        files = manifest["files"]
+        databases = set(manifest["databases"])
+        if (manifest["version"] != 1 or set(by_name) != {"manifest.json", *files}
+                or not databases or not databases <= files.keys()):
+            raise RuntimeError("Archive manifest does not match its contents")
+        with tempfile.TemporaryDirectory(prefix=".verify-", dir=path.parent) as tmp:
+            for index, (name, expected) in enumerate(files.items()):
+                with archive.extractfile(by_name[name]) as stream:
+                    if name in databases:
+                        restored = Path(tmp) / f"restored-{index}.sqlite"
+                        with restored.open("wb") as output:
+                            actual = digest(stream, output)
+                        sqlite_check(restored)
+                        restored.unlink()
+                    else:
+                        actual = digest(stream)
+                if actual != expected:
+                    raise RuntimeError(f"SHA-256 mismatch: {name}")
+    return len(files), len(databases)
+
+
+def create_archive(destination, files, databases):
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = destination.stat()
+    if destination.is_symlink() or (os.name == "posix" and (
+        info.st_mode & 0o077 or info.st_uid != os.geteuid()
+    )):
+        raise RuntimeError("Backup directory must be private and not a symlink")
+    now = datetime.now(timezone.utc)
+    name = f"netwatch-{now:%Y%m%dT%H%M%S%fZ}-{secrets.token_hex(4)}.tar.gz"
+    with tempfile.TemporaryDirectory(prefix=".create-", dir=destination) as tmp:
+        work = Path(tmp)
+        checksums = {}
+        pending = work / name
+        with tarfile.open(pending, "w:gz", compresslevel=3) as archive:
+            for relative, source in {**files, **databases}.items():
+                target = work / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if relative in databases:
+                    sqlite_backup(source, target)
+                else:
+                    shutil.copy2(source, target)
+                with target.open("rb") as stream:
+                    checksums[relative] = digest(stream)
+                archive.add(target, arcname=relative, recursive=False)
+            manifest = work / "manifest.json"
+            manifest.write_text(json.dumps({
+                "version": 1, "created_utc": now.isoformat(), "files": checksums,
+                "databases": sorted(databases),
+            }, indent=2), encoding="utf-8")
+            archive.add(manifest, arcname="manifest.json", recursive=False)
+        verify_archive(pending)
+        with pending.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        result = destination / name
+        os.replace(pending, result)
+        sync_directory(destination)
+    return result
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def mount_uuid(mount):
+    output = subprocess.run([
+        "findmnt", "--mountpoint", str(mount), "--noheadings", "--output", "UUID",
+    ], capture_output=True, text=True, timeout=5)
+    return output.stdout.strip().lower() if output.returncode == 0 else ""
+
+
+def encrypted_usb_copy(archive, mount, uuid, recipient):
+    if mount_uuid(mount) != uuid.lower():
+        return False
+    fd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if (mount_uuid(mount) != uuid.lower()
+                or os.fstat(fd).st_dev != mount.stat().st_dev):
+            return False
+        try:
+            os.mkdir("netwatch-backups", mode=0o700, dir_fd=fd)
+        except FileExistsError:
+            pass
+        target = os.open("netwatch-backups", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            temporary = f".partial-{secrets.token_hex(8)}"
+            output = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=target)
+            try:
+                with os.fdopen(output, "wb") as stream:
+                    subprocess.run(
+                        ["age", "--encrypt", "--recipient", recipient, str(archive)],
+                        stdout=stream, check=True, timeout=600,
+                    )
+                    stream.flush()
+                    if stream.tell() == 0:
+                        raise RuntimeError("Encrypted USB archive is empty")
+                    os.fsync(stream.fileno())
+                os.replace(temporary, archive.name + ".age", src_dir_fd=target, dst_dir_fd=target)
+                os.fsync(target)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=target)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(target)
+    finally:
+        os.close(fd)
+    return True
+
+
+def prune(destination, keep):
+    if keep < 1:
+        return
+    archives = sorted(path for path in destination.iterdir()
+                      if ARCHIVE_NAME.fullmatch(path.name) and path.is_file() and not path.is_symlink())
+    for path in archives[:-keep]:
+        path.unlink()
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("create")
+    verify = sub.add_parser("verify")
+    verify.add_argument("archive", type=Path)
+    args = parser.parse_args()
+    if args.action == "verify":
+        files, databases = verify_archive(args.archive.resolve())
+        print(f"Проверены файлы: {files}. SQLite восстановлены во временный каталог и проверены: {databases}.")
+        return 0
+
+    archive = create_archive(DESTINATION, live_files(), database_files())
+    print(f"Локальный архив проверен: {archive}", flush=True)
+    usb = [os.getenv(key, "") for key in ("NETWATCH_USB_MOUNT", "NETWATCH_USB_UUID", "NETWATCH_AGE_RECIPIENT")]
+    if any(usb):
+        if not all(usb) or not Path(usb[0]).is_absolute() or not usb[2].startswith("age1"):
+            raise RuntimeError("Incomplete USB backup configuration")
+        if not encrypted_usb_copy(archive, Path(usb[0]), usb[1], usb[2]):
+            print("USB-копия пропущена: настроенный носитель не смонтирован.", file=sys.stderr)
+            return 2
+        print(f"Зашифрованная копия на USB: {archive.name}.age")
+    prune(DESTINATION, int(os.getenv("NETWATCH_BACKUP_KEEP", "0")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

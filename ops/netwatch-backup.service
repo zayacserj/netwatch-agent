@@ -1,0 +1,15 @@
+[Unit]
+Description=Create and verify NetWatch backups
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+EnvironmentFile=-/etc/netwatch-backup.conf
+ExecStart=/usr/bin/python3 -B /opt/netwatch/ops/backup_netwatch.py create
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes

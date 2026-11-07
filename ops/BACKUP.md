@@ -16,8 +16,8 @@
 ## Запуск и проверка
 
 ```bash
-python3 -B /opt/netwatch/ops/backup_netwatch.py create
-python3 -B /opt/netwatch/ops/backup_netwatch.py verify /путь/к/netwatch-*.tar.gz
+python3 -IB /usr/local/lib/netwatch/backup_netwatch.py create
+python3 -IB /usr/local/lib/netwatch/backup_netwatch.py verify /путь/к/netwatch-*.tar.gz
 ```
 
 В команду `verify` передаётся путь к одному конкретному архиву.
@@ -48,3 +48,15 @@ NETWATCH_BACKUP_KEEP=14
 Для контрольного восстановления передайте путь к архиву на USB
 в команду `verify`. Она проверит контрольные суммы и целостность
 извлечённых копий SQLite.
+
+## Подготовка к восстановлению
+
+```bash
+python3 -IB /usr/local/lib/netwatch/backup_netwatch.py prepare-restore /путь/к/архиву.tar.gz
+```
+
+Команда проверяет целостность архива, наличие файлов NetWatch и веб-монитора,
+статического каталога Caddy и версий Python-пакетов. Она извлекает файлы
+в отдельный каталог с доступом только для владельца. Рабочая система
+на этом этапе не меняется. Для этого режима нужен архив, сделанный после
+добавления профиля восстановления.

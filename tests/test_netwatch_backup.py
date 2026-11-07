@@ -74,3 +74,32 @@ class Backup(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), [
             "before-manual-maintenance.tar.gz", "netwatch-20261108T032000000000Z-bbbbbbbb.tar.gz",
         ])
+
+    def test_prepare_restore_checks_runtime_and_uses_private_staging(self):
+        database = self.root / "live.db"
+        fixture = self.root / "fixture"
+        fixture.write_text("placeholder", encoding="utf-8")
+        with closing(sqlite3.connect(database)) as conn:
+            conn.execute("CREATE TABLE devices (mac TEXT)")
+        paths = {
+            f"opt/netwatch/{name}": fixture for name in (
+                "api.py", "db.py", "netwatch_telegram_bot.py", ".env", "agent3.sh",
+                "monitor/pi_monitor.py", "monitor/index.html", "monitor/style.css",
+                "monitor/dashboard.js",
+            )
+        }
+        paths.update({"etc/caddy/Caddyfile": fixture, "var/www/netwatch/agent.sh": fixture})
+        with patch.object(backup, "sync_directory"):
+            archive = backup.create_archive(
+                self.root / "scheduled", paths, {"opt/netwatch/netwatch.db": database},
+                runtime={"python": "3.13", "packages": {"aiohttp": "3.14.5", "aiogram": "3.31.0"}},
+            )
+        stage, profile = backup.prepare_restore(archive, self.root)
+        self.assertEqual(stage.parent, self.root)
+        self.assertEqual(profile["python"], "3.13")
+        self.assertEqual((stage / "requirements.txt").read_text(),
+                         "aiohttp==3.14.5\naiogram==3.31.0\n")
+        self.assertTrue((stage / "var/www/netwatch/agent.sh").is_file())
+        self.assertFalse((self.root / "etc").exists())
+        with self.assertRaises(RuntimeError):
+            backup.safe_restore_path("opt/netwatch/../../outside")

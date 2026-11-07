@@ -118,8 +118,9 @@ needs_forward() {
             }
             END { exit !overlap }
         '; then
+            destination=$(get "$section.dest")
             [ "$ports" = "$wanted" ] && [ "$proto" = tcp ] &&
-            [ "$(get "$section.dest")" = lan ] &&
+            { [ "$destination" = lan ] || [ -z "$destination" ]; } &&
             [ "$(get "$section.dest_ip")" = "$pi_ip" ] &&
             [ "$(get "$section.dest_port")" = "$wanted" ] &&
             [ -z "$(get "$section.src_ip")" ] &&

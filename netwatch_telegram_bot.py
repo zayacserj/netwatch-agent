@@ -22,6 +22,7 @@ if ENV_PATH.exists():
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
@@ -42,6 +43,7 @@ from db import (
     delete_router_complete,
     disable_device_notifications, get_notification_settings, toggle_notification_setting,
     rename_user_router,
+    get_admin_user,
 )
 
 logging.basicConfig(
@@ -668,56 +670,251 @@ async def cmd_health(message: Message):
 
 
 # --- /admin ---
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.reply("⛔ Доступ запрещён. Только для администратора.")
-        return
+class AdminFlow(StatesGroup):
+    broadcast_text = State()
+    confirming = State()
+
+
+ADMIN_USERS_PER_PAGE = 12
+_broadcast_lock = asyncio.Lock()
+
+
+def admin_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="👥 Список пользователей", callback_data="admin_list_users")
-    builder.button(text="🧹 Очистить данные пользователя", callback_data="admin_clean_prompt")
-    await message.reply("🔐 Админ-панель:\nВыберите действие:", reply_markup=builder.as_markup())
+    builder.button(text="👥 Список пользователей", callback_data="admin_users|0")
+    builder.button(text="🖥 Мониторинг Pi", callback_data="admin_pi")
+    builder.button(text="📣 Сообщение всем пользователям", callback_data="admin_broadcast")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
-# --- Admin callbacks ---
-@dp.callback_query(F.data == "admin_list_users")
-async def admin_list_users(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Нет доступа")
+def admin_confirm_keyboard(token, label):
+    builder = InlineKeyboardBuilder()
+    builder.button(text=label, callback_data=f"admin_confirm|{token}")
+    builder.button(text="Отмена", callback_data="admin_home")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def admin_message_allowed(message):
+    return message.chat.type == "private" and is_admin(message.from_user.id)
+
+
+async def admin_callback_allowed(callback):
+    if (callback.message is not None and callback.message.chat.type == "private"
+            and is_admin(callback.from_user.id)):
+        return True
+    await callback.answer("Панель доступна администраторам в личном чате.", show_alert=True)
+    return False
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not admin_message_allowed(message):
+        await message.reply("⛔ Панель доступна администраторам в личном чате.")
         return
-    users = get_all_users()
-    if not users:
-        await callback.message.edit_text("📭 Нет пользователей.")
-        await callback.answer()
+    await state.clear()
+    await message.reply("🔐 Админ-панель NetWatch", reply_markup=admin_keyboard())
+
+
+@dp.callback_query(F.data == "admin_home")
+async def admin_home(callback: CallbackQuery, state: FSMContext):
+    if not await admin_callback_allowed(callback):
         return
-    lines = ["👥 *Все пользователи:*"]
-    for u in users:
-        admin_tag = " (👑 админ)" if u["is_admin"] else ""
-        lines.append(f"`{u['chat_id']}` {u['username'] or ''} {u['first_name'] or ''}{admin_tag}")
-    lines.append("\nУдалить пользователя:\n`/admin_clean_user <chat_id> del`")
-    lines.append("Очистить данные:\n`/admin_clean_user <chat_id> clean`")
-    await callback.message.edit_text("\n".join(lines), )
+    await state.clear()
     await callback.answer()
+    await callback.message.edit_text("🔐 Админ-панель NetWatch", reply_markup=admin_keyboard())
 
 
-@dp.message(F.text.regexp(r"^/admin_clean_user\s+\d+\s+(del|clean)$"))
-async def admin_clean_input(message: Message):
-    if not is_admin(message.from_user.id):
+@dp.callback_query(F.data == "admin_pi")
+async def admin_pi(callback: CallbackQuery):
+    if await admin_callback_allowed(callback):
+        await callback.answer("Мониторинг Pi пока не настроен.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("admin_users|"))
+async def admin_list_users(callback: CallbackQuery, state: FSMContext):
+    if not await admin_callback_allowed(callback):
         return
-    parts = message.text.strip().split()
-    try:
-        chat_id = int(parts[1])
-        action = parts[2]
-        if action == "del":
-            delete_user(chat_id)
-            await message.reply(f"✅ Пользователь {chat_id} удалён вместе с данными.")
-        elif action == "clean":
-            clean_user_data(chat_id)
-            await message.reply(f"🧹 Данные пользователя {chat_id} очищены (роутеры, устройства, события, health-check).")
-    except ValueError:
-        await message.reply("❌ Неверный chat_id")
-    except Exception as e:
-        await message.reply(f"❌ Ошибка: {e}")
+    raw = callback.data.split("|", 1)[1]
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 8:
+        await callback.answer("Страница недоступна")
+        return
+    page = int(raw)
+    users = get_all_users(limit=ADMIN_USERS_PER_PAGE + 1, offset=page * ADMIN_USERS_PER_PAGE)
+    if page and not users:
+        page = 0
+        users = get_all_users(limit=ADMIN_USERS_PER_PAGE + 1)
+    await state.clear()
+    builder = InlineKeyboardBuilder()
+    for user in users[:ADMIN_USERS_PER_PAGE]:
+        name = " ".join((user["username"] or user["first_name"] or "").split())[:32]
+        label = f"{user['chat_id']} · {name}" if name else str(user["chat_id"])
+        builder.button(text=label, callback_data=f"admin_user|{user['chat_id']}")
+    builder.adjust(1)
+    navigation = []
+    if page:
+        navigation.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"admin_users|{page - 1}"))
+    if len(users) > ADMIN_USERS_PER_PAGE:
+        navigation.append(InlineKeyboardButton(text="Далее ▶", callback_data=f"admin_users|{page + 1}"))
+    if navigation:
+        builder.row(*navigation)
+    builder.row(InlineKeyboardButton(text="В админ-панель", callback_data="admin_home"))
+    text = f"👥 Пользователи · страница {page + 1}" if users else "📭 Нет пользователей."
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+
+def admin_target(raw):
+    if not raw.isascii() or not raw.isdecimal() or not 1 <= len(raw) <= 18:
+        return None
+    return get_admin_user(int(raw))
+
+
+@dp.callback_query(F.data.startswith("admin_user|"))
+async def admin_user_card(callback: CallbackQuery, state: FSMContext):
+    if not await admin_callback_allowed(callback):
+        return
+    user = admin_target(callback.data.split("|", 1)[1])
+    if user is None:
+        await callback.answer("Пользователь не найден")
+        return
+    await state.clear()
+    chat_id = user["chat_id"]
+    name = user["first_name"] or "н/д"
+    username = "@" + user["username"] if user["username"] else "н/д"
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🧹 Удалить данные пользователя", callback_data=f"admin_action|clean|{chat_id}")
+    builder.button(text="🗑 Удалить пользователя", callback_data=f"admin_action|delete|{chat_id}")
+    builder.button(text="К списку пользователей", callback_data="admin_users|0")
+    builder.adjust(1)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"👤 Пользователь {chat_id}\nИмя: {name}\nTelegram: {username}\n"
+        f"Роутеров: {user['router_count']}",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_action|"))
+async def admin_user_action(callback: CallbackQuery, state: FSMContext):
+    if not await admin_callback_allowed(callback):
+        return
+    parts = callback.data.split("|")
+    user = admin_target(parts[2]) if len(parts) == 3 and parts[1] in ("clean", "delete") else None
+    if user is None:
+        await callback.answer("Действие недоступно")
+        return
+    action, chat_id = parts[1], user["chat_id"]
+    token = secrets.token_hex(8)
+    await state.set_data({"token": token, "action": action, "chat_id": chat_id})
+    await state.set_state(AdminFlow.confirming)
+    scope = "Запись пользователя и его настройки тоже будут удалены." if action == "delete" else (
+        "Запись пользователя и его настройки сохранятся."
+    )
+    await callback.answer()
+    await callback.message.edit_text(
+        f"Подтвердите удаление данных пользователя {chat_id}.\n\n"
+        f"Будут удалены привязки ({user['router_count']}), устройства, история и коды привязки.\n"
+        + scope,
+        reply_markup=admin_confirm_keyboard(token, "Подтвердить удаление"),
+    )
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_prompt(callback: CallbackQuery, state: FSMContext):
+    if not await admin_callback_allowed(callback):
+        return
+    await state.clear()
+    await state.set_state(AdminFlow.broadcast_text)
+    await callback.answer()
+    await callback.message.edit_text("📣 Отправьте текст рассылки одним сообщением. Для отмены — /cancel.")
+
+
+@dp.message(AdminFlow.broadcast_text, Command("cancel"))
+@dp.message(AdminFlow.confirming, Command("cancel"))
+async def cancel_admin_action(message: Message, state: FSMContext):
+    if admin_message_allowed(message):
+        await state.clear()
+        await message.reply("Действие отменено.", reply_markup=admin_keyboard())
+
+
+@dp.message(AdminFlow.broadcast_text, F.text & ~F.text.startswith("/"))
+async def admin_broadcast_preview(message: Message, state: FSMContext):
+    if not admin_message_allowed(message):
+        await state.clear()
+        return
+    text = message.text
+    if not text.strip() or len(text.encode("utf-16-le")) // 2 > 4096:
+        await message.reply("Введите текст рассылки длиной до 4096 символов или /cancel.")
+        return
+    count = len(get_all_users())
+    if not count:
+        await state.clear()
+        await message.reply("📭 Получателей пока нет.", reply_markup=admin_keyboard())
+        return
+    token = secrets.token_hex(8)
+    await state.set_data({"token": token, "action": "broadcast", "text": text})
+    await state.set_state(AdminFlow.confirming)
+    preview = text if len(text) <= 800 else text[:800] + "…"
+    await message.reply(
+        f"📣 Предпросмотр рассылки · пользователей в базе: {count}\n\n{preview}",
+        reply_markup=admin_confirm_keyboard(token, "Отправить всем"),
+    )
+
+
+async def send_admin_broadcast(telegram_bot, users, text):
+    sent = failed = 0
+    for user in users:
+        chat_id = user["chat_id"]
+        try:
+            try:
+                await telegram_bot.send_message(chat_id, text, parse_mode=None)
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after)
+                await telegram_bot.send_message(chat_id, text, parse_mode=None)
+        except TelegramAPIError:
+            failed += 1
+        else:
+            sent += 1
+        await asyncio.sleep(0.05)
+    return sent, failed
+
+
+@dp.callback_query(F.data.startswith("admin_confirm|"))
+async def admin_confirm(callback: CallbackQuery, state: FSMContext):
+    if not await admin_callback_allowed(callback):
+        return
+    data = await state.get_data()
+    if (await state.get_state() != AdminFlow.confirming.state
+            or data.get("token") != callback.data.split("|", 1)[1]):
+        await callback.answer("Подтверждение уже использовано или отменено.")
+        return
+    action = data["action"]
+    if action == "broadcast" and _broadcast_lock.locked():
+        await callback.answer("Уже идёт другая рассылка. Повторите чуть позже.")
+        return
+    await state.clear()
+    await callback.answer()
+    if action == "broadcast":
+        async with _broadcast_lock:
+            users = get_all_users()
+            await callback.message.edit_text("📣 Рассылка запущена.")
+            sent, failed = await send_admin_broadcast(callback.bot, users, data["text"])
+        result = f"📣 Рассылка завершена. Отправлено: {sent}. Не доставлено: {failed}."
+    else:
+        chat_id = data["chat_id"]
+        if action == "clean":
+            changed = clean_user_data(chat_id)
+            result = f"🧹 Данные пользователя {chat_id} удалены. Учётная запись сохранена."
+        elif action == "delete":
+            changed = delete_user(chat_id)
+            result = f"🗑 Пользователь {chat_id} удалён вместе с данными."
+        else:
+            return
+        if not changed:
+            result = "Пользователь не найден."
+    await callback.message.edit_text(result, reply_markup=admin_keyboard())
 
 
 # --- Bot commands setup ---

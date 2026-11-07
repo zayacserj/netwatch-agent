@@ -75,6 +75,41 @@ class UserDevices(unittest.TestCase):
             conn.execute("UPDATE devices SET hostname='*' WHERE mac='shared' AND router_id='r1'")
         self.assertIsNone(db.get_device(1, 'shared', 'r2')['known_hostname'])
 
+    def test_admin_cleanup_and_delete_have_different_scope(self):
+        db.create_pairing_code('old-code', 1)
+        db.create_pairing_code('other-code', 2)
+        db.add_event('r1', 'shared', 'device_online')
+        db.add_health_check('r1', True, True, '1%', '1MiB', 1, None, None)
+        db.mark_device_notified(1, 'shared', 'r1', notification_state=1)
+        db.toggle_notification_setting(1, 'router')
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO router_secrets(router_id,secret) VALUES ('r1','old')")
+
+        self.assertTrue(db.clean_user_data(1))
+        self.assertIsNotNone(db.get_admin_user(1))
+        self.assertTrue(db.get_notification_settings(1)['router'])
+        self.assertEqual(db.get_user_routers(1), [])
+        self.assertEqual(db.get_user_devices(1), [])
+        self.assertEqual(db.get_user_events(1), [])
+        self.assertIsNone(db.get_latest_health('r1'))
+        self.assertFalse(db.is_valid_router_secret('old'))
+        self.assertIsNone(db.get_pairing_code('old-code'))
+        self.assertIsNotNone(db.get_pairing_code('other-code'))
+        self.assertEqual(len(db.get_user_routers(2)), 1)
+        with db.db_session() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM device_notifications").fetchone()[0], 0)
+
+        db.upsert_router('replacement', 1, name='Replacement')
+        db.create_pairing_code('replacement-code', 1)
+        self.assertTrue(db.delete_user(1))
+        self.assertFalse(db.delete_user(1))
+        self.assertIsNone(db.get_admin_user(1))
+        self.assertEqual(db.get_user_routers(1), [])
+        self.assertIsNone(db.get_pairing_code('replacement-code'))
+        self.assertEqual([user['chat_id'] for user in db.get_all_users()], [2])
+        with db.db_session() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM user_settings").fetchone()[0], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

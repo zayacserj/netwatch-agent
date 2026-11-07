@@ -208,28 +208,47 @@ def set_admin(chat_id, value=True):
     conn.close()
 
 
-def get_all_users():
-    conn = get_conn()
-    rows = conn.execute("SELECT chat_id, username, first_name, is_admin FROM users ORDER BY chat_id").fetchall()
-    conn.close()
+def get_all_users(limit=-1, offset=0):
+    with db_session() as conn:
+        rows = conn.execute("""
+            SELECT chat_id, username, first_name, is_admin
+            FROM users ORDER BY chat_id LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
     return [dict(r) for r in rows]
 
 
+def get_admin_user(chat_id):
+    with db_session() as conn:
+        row = conn.execute("""
+            SELECT u.chat_id, u.username, u.first_name,
+                   (SELECT COUNT(*) FROM routers WHERE chat_id=u.chat_id) AS router_count
+            FROM users u WHERE u.chat_id=?
+        """, (chat_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def _remove_user_router_data(conn, chat_id):
+    conn.execute("""
+        DELETE FROM pairing_codes WHERE chat_id=? OR router_id IN (
+            SELECT router_id FROM routers WHERE chat_id=?
+        )
+    """, (chat_id, chat_id))
+    conn.execute("DELETE FROM routers WHERE chat_id=?", (chat_id,))
+
+
 def delete_user(chat_id):
-    conn = get_conn()
-    conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        _remove_user_router_data(conn, chat_id)
+        return conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,)).rowcount == 1
 
 
 def clean_user_data(chat_id):
-    conn = get_conn()
-    routers = conn.execute("SELECT router_id FROM routers WHERE chat_id=?", (chat_id,)).fetchall()
-    for r in routers:
-        conn.execute("DELETE FROM routers WHERE router_id=?", (r["router_id"],))
-    conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM users WHERE chat_id=?", (chat_id,)).fetchone() is None:
+            return False
+        _remove_user_router_data(conn, chat_id)
+        return True
 
 
 # --- notification settings ---

@@ -1,0 +1,12 @@
+# Include this route inside the existing HTTPS site block after local validation.
+# Replace the example login and hash with a dedicated account. Generate the
+# hash interactively with caddy hash-password. Keep it outside Git.
+@pi_monitor path /monitor /monitor/*
+handle @pi_monitor {
+    basic_auth {
+        monitor REPLACE_WITH_PASSWORD_HASH
+    }
+    reverse_proxy 127.0.0.1:8090 {
+        header_up -Authorization
+    }
+}

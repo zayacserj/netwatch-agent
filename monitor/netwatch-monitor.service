@@ -1,0 +1,21 @@
+[Unit]
+Description=NetWatch Raspberry Pi metrics dashboard
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/netwatch/monitor
+ExecStart=/usr/bin/python3 -B /opt/netwatch/monitor/pi_monitor.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET
+
+[Install]
+WantedBy=multi-user.target

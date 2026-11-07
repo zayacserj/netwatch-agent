@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Raspberry Pi — NetWatch</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./dashboard.js"></script>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">NETWATCH / СИСТЕМНЫЙ МОНИТОР</p>
+        <h1>Raspberry Pi</h1>
+      </div>
+      <div class="connection">
+        <span id="connection" class="badge" role="status">Подключение</span>
+        <p id="updated">Ожидание первого снимка</p>
+      </div>
+    </header>
+
+    <section class="metrics" aria-label="Основные показатели">
+      <article class="panel"><h2>Процессор</h2><p class="value" id="cpu">—</p>
+        <progress id="cpu-bar" max="100" aria-label="Загрузка CPU"></progress></article>
+      <article class="panel"><h2>Память</h2><p class="value" id="ram">—</p>
+        <progress id="ram-bar" max="100" aria-label="Использование RAM"></progress>
+        <p id="ram-detail" class="detail"></p></article>
+      <article class="panel"><h2>Температура CPU</h2><p class="value" id="temperature">—</p>
+        <p class="detail">Датчик процессора</p></article>
+      <article class="panel"><h2>Время работы</h2><p class="value" id="uptime">—</p>
+        <p class="detail">С последней загрузки</p></article>
+    </section>
+
+    <section class="columns">
+      <article class="panel"><h2>Накопители</h2><div id="storage" class="rows"><p>Ожидание данных</p></div></article>
+      <article class="panel"><h2>Сетевые интерфейсы</h2><div id="network" class="rows"><p>Ожидание данных</p></div></article>
+    </section>
+    <section class="columns">
+      <article class="panel">
+        <h2>Службы NetWatch</h2>
+        <div id="core" class="rows"><p>Ожидание данных</p></div>
+        <details><summary>Все запущенные службы <span id="service-count"></span></summary>
+          <ul id="services"></ul></details>
+      </article>
+      <article class="panel"><h2>Контейнеры</h2><div id="containers" class="rows"><p>Ожидание данных</p></div></article>
+    </section>
+    <footer>Показатели системы обновляются каждые 5 секунд. Службы и контейнеры — примерно раз в 30 секунд.</footer>
+  </main>
+</body>
+</html>

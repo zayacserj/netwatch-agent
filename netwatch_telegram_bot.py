@@ -680,9 +680,24 @@ _broadcast_lock = asyncio.Lock()
 
 
 def admin_keyboard():
+    from urllib.parse import urlsplit
+
+    monitor_url = os.getenv("PI_MONITOR_URL", "").strip()
+    try:
+        address = urlsplit(monitor_url)
+        valid = (address.scheme == "https" and bool(address.hostname)
+                 and address.username is None and address.password is None
+                 and not address.query and not address.fragment
+                 and not any(char.isspace() for char in monitor_url))
+    except ValueError:
+        valid = False
+
     builder = InlineKeyboardBuilder()
     builder.button(text="👥 Список пользователей", callback_data="admin_users|0")
-    builder.button(text="🖥 Мониторинг Pi", callback_data="admin_pi")
+    if valid:
+        builder.button(text="🖥 Мониторинг Pi", url=monitor_url)
+    else:
+        builder.button(text="🖥 Мониторинг Pi", callback_data="admin_pi")
     builder.button(text="📣 Сообщение всем пользователям", callback_data="admin_broadcast")
     builder.adjust(1)
     return builder.as_markup()

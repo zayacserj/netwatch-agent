@@ -29,13 +29,22 @@ from aiohttp import web
 
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router,
-    add_event, can_notify_device, mark_device_notified, init_db, db_session
+    add_event, can_notify_device, mark_device_notified, init_db, db_session, get_device
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
 ROUTER_OFFLINE_AFTER = 7 * 60
+KEEP_KNOWN_HOSTNAME = """
+    CASE WHEN lower(trim(excluded.hostname)) NOT IN ('', '*', 'unknown')
+         THEN excluded.hostname ELSE devices.hostname END
+"""
+
+
+def notification_device_name(conn, chat_id, mac, router_id):
+    device = get_device(chat_id, mac, router_id, conn=conn)
+    return (device["custom_name"] or device["known_hostname"] or mac) if device else mac
 
 # --- Telegram notification helper ---
 def send_telegram_notification(chat_id, text):
@@ -178,28 +187,27 @@ async def post_event(request):
         # DISCONNECTED also contains CONNECTED; exclude it from this branch.
         if "CONNECTED" in event_upper and "DISCONNECTED" not in event_upper:
             # Проверяем предыдущий статус
-            prev = conn.execute("SELECT online, watch_online, custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
+            prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?",
                                 (mac, data["router_id"])).fetchone()
             was_online = prev["online"] if prev else 0
             watch_online = prev["watch_online"] if prev else 1
             record_device_arrival(conn, data["router_id"], chat_id, mac)
 
-            conn.execute("""
+            conn.execute(f"""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
                 VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(mac, router_id) DO UPDATE SET
                     online=1, last_seen=excluded.last_seen,
-                    ip=excluded.ip, hostname=excluded.hostname,
+                    ip=excluded.ip, hostname={KEEP_KNOWN_HOSTNAME},
                     custom_name=COALESCE(excluded.custom_name, devices.custom_name)
             """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
 
             # Уведомление о подключении, если был оффлайн (с дедупликацией)
             if chat_id and was_online == 0 and watch_online == 1:
-                device_name = (data.get("custom_name") or (prev["custom_name"] if prev else None)
-                               or data.get("hostname") or (prev["hostname"] if prev else None) or mac)
                 if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
                     mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
                     label = "🆕 Новое устройство" if prev is None else "🟢 Устройство онлайн"
+                    device_name = notification_device_name(conn, chat_id, mac, data["router_id"])
                     notifications.append((chat_id, f"{label}: `{mac}` — {device_name}"))
 
         elif "DISCONNECTED" in event_upper:
@@ -214,11 +222,9 @@ async def post_event(request):
 
             # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
             if chat_id and was_online == 1 and watch_online == 1:
-                device_name = conn.execute("SELECT custom_name, hostname FROM devices WHERE mac=? AND router_id=?",
-                                           (mac, data["router_id"])).fetchone()
-                name = (device_name["custom_name"] or device_name["hostname"] or mac) if device_name else mac
                 if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=0):
                     mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=0)
+                    name = notification_device_name(conn, chat_id, mac, data["router_id"])
                     notifications.append((chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}"))
 
     for chat_id, text in notifications:
@@ -252,16 +258,16 @@ async def post_devices(request):
                 continue
 
             # Check if device is new
-            prev = conn.execute("SELECT online, watch_online, custom_name, hostname FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
+            prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
             is_new = prev is None
             record_device_arrival(conn, data["router_id"], chat_id, mac)
 
-            conn.execute("""
+            conn.execute(f"""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
                 VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(mac, router_id) DO UPDATE SET
                     ip=excluded.ip,
-                    hostname=excluded.hostname,
+                    hostname={KEEP_KNOWN_HOSTNAME},
                     custom_name=COALESCE(excluded.custom_name, devices.custom_name),
                     online=1,
                     last_seen=excluded.last_seen
@@ -269,16 +275,15 @@ async def post_devices(request):
             saved += 1
 
             if is_new and chat_id:
-                device_name = dev.get("custom_name") or dev.get("hostname") or mac
                 if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
                     mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
+                    device_name = notification_device_name(conn, chat_id, mac, data["router_id"])
                     notifications.append((chat_id, f"🆕 Новое устройство: `{mac}` — {device_name}"))
                 new_devices.append(mac)
             elif chat_id and prev["online"] == 0 and prev["watch_online"] == 1:
-                device_name = (dev.get("custom_name") or prev["custom_name"]
-                               or dev.get("hostname") or prev["hostname"] or mac)
                 if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
                     mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
+                    device_name = notification_device_name(conn, chat_id, mac, data["router_id"])
                     notifications.append((chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}"))
 
     for chat_id, text in notifications:
@@ -447,7 +452,7 @@ async def check_offline_devices(app):
 
                 # Update status for every stale device; watch_online controls messages only.
                 stale_devices = conn.execute("""
-                    SELECT d.mac, d.router_id, d.custom_name, d.hostname, d.watch_online, r.chat_id
+                    SELECT d.mac, d.router_id, d.watch_online, r.chat_id
                     FROM devices d
                     JOIN routers r ON d.router_id = r.router_id
                     WHERE d.online=1 AND d.last_seen < ?
@@ -465,7 +470,7 @@ async def check_offline_devices(app):
                     if (chat_id and dev["watch_online"] == 1
                             and can_notify_device(chat_id, mac, router_id, conn=conn, notification_state=0)):
                         mark_device_notified(chat_id, mac, router_id, conn=conn, notification_state=0)
-                        device_name = dev["custom_name"] or dev["hostname"] or mac
+                        device_name = notification_device_name(conn, chat_id, mac, router_id)
                         notifications.append((chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}"))
 
                 record_history_timeouts(conn, now, threshold)

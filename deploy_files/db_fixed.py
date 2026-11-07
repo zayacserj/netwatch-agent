@@ -429,16 +429,15 @@ def set_device_online(mac, router_id, online=True):
     conn.close()
 
 
-def get_device(chat_id, mac, router_id):
+def get_device(chat_id, mac, router_id, *, conn=None):
     """Get single device by MAC and router for user"""
-    conn = get_conn()
-    row = conn.execute(f"""
-        SELECT d.*, r.name AS router_name, {_DEVICE_HOSTNAME_SQL}
-        FROM devices d
-        JOIN routers r ON d.router_id = r.router_id
-        WHERE r.chat_id=? AND d.mac=? AND d.router_id=?
-    """, (chat_id, mac.lower(), router_id)).fetchone()
-    conn.close()
+    with db_session(conn) as session:
+        row = session.execute(f"""
+            SELECT d.*, r.name AS router_name, {_DEVICE_HOSTNAME_SQL}
+            FROM devices d
+            JOIN routers r ON d.router_id = r.router_id
+            WHERE r.chat_id=? AND d.mac=? AND d.router_id=?
+        """, (chat_id, mac.lower(), router_id)).fetchone()
     return dict(row) if row else None
 
 

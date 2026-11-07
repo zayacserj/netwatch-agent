@@ -559,6 +559,29 @@ class Transactions(unittest.TestCase):
         self.run_handler('post_event', dict(router_id='r', mac='aa', event='CONNECTED'))
         self.assertEqual(len(self.sent), 1)
 
+    def test_notifications_use_known_name_from_another_router_of_same_user(self):
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO users(chat_id) VALUES (2)")
+            conn.executemany("INSERT INTO routers(router_id,chat_id) VALUES (?, ?)",
+                             [('own', 1), ('other', 2)])
+            conn.executemany("""
+                INSERT INTO devices(mac,router_id,hostname,last_seen) VALUES (?, ?, ?, ?)
+            """, [('aa', 'own', 'iPhone15pro', 1), ('aa', 'other', 'Private name', 2),
+                  ('bb', 'other', 'Private name', 2)])
+        self.run_handler('post_devices', dict(router_id='r', devices=[
+            {'mac': 'aa', 'hostname': 'unknown'}, {'mac': 'bb', 'hostname': '*'},
+        ]))
+        self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
+        self.run_handler('post_devices', dict(router_id='r', devices=[
+            {'mac': 'aa', 'hostname': 'unknown'},
+        ]))
+        self.assertEqual(self.sent, [
+            (1, '🆕 Новое устройство: `aa` — iPhone15pro'),
+            (1, '🆕 Новое устройство: `bb` — bb'),
+            (1, '🔴 Устройство оффлайн: `aa` — iPhone15pro'),
+            (1, '🟢 Устройство онлайн: `aa` — iPhone15pro'),
+        ])
+
     def test_snapshot_reconnect_without_watch_updates_silently(self):
         self.seed_device(online=0, watch=0)
         self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))

@@ -372,6 +372,7 @@ cmd_run() {
     local podkop_status="unknown"
     local podkop_test=null
     local podkop_latency_ms=null
+    local proxy_tag=''
 
     # Проверка интернета
     if ping -c 1 -W 3 8.8.8.8 > /dev/null 2>&1; then
@@ -457,7 +458,7 @@ $(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
     # CURL_HOME confines timeouts to these Podkop CLI calls; no global config
     # or proxy selection is modified. Old/unsupported commands stay unknown.
     if [ "$podkop_status" = running ]; then
-        local probe_dir proxies proxy_tag encoded_tag latency_json measured
+        local probe_dir proxies encoded_tag latency_json measured
         if probe_dir=$(mktemp -d /tmp/netwatch-probe.XXXXXX); then
             if printf 'connect-timeout = 3\nmax-time = 8\n' > "$probe_dir/.curlrc"; then
                 if proxies=$(CURL_HOME="$probe_dir" podkop clash_api get_proxies 2>/dev/null); then
@@ -557,10 +558,12 @@ $(printf '%s\n' "$assoc" | awk '/dBm/ {print tolower($1)}')"
     echo ""
 
     # Отправка health-check на /health
+    local proxy_tag_json
+    proxy_tag_json=$(printf '%s' "$proxy_tag" | jq -Rs 'if length > 0 then . else null end') || return 1
     curl -sS -4 -X POST "$PI_URL/health" \
         -H "Content-Type: application/json" \
         -H "X-Agent-Secret: $AGENT_SECRET" \
-        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu_escaped\",\"ram\":\"$ram_escaped\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status_escaped\",\"podkop_test\":$podkop_test,\"podkop_latency_ms\":$podkop_latency_ms,\"timestamp\":$timestamp}"
+        -d "{\"router_id\":\"$router_id\",\"internet\":$internet,\"wifi\":$wifi_status,\"cpu\":\"$cpu_escaped\",\"ram\":\"$ram_escaped\",\"wifi_clients\":$wifi_clients,\"podkop_status\":\"$podkop_status_escaped\",\"podkop_test\":$podkop_test,\"podkop_latency_ms\":$podkop_latency_ms,\"podkop_proxy_tag\":$proxy_tag_json,\"timestamp\":$timestamp}"
     echo ""
 }
 

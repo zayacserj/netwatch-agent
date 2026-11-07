@@ -63,6 +63,18 @@ class UserDevices(unittest.TestCase):
         self.assertEqual(db.get_device(1, 'shared', 'r1')['custom_name'], 'Колонка')
         self.assertIsNone(db.get_device(1, 'shared', 'r2')['custom_name'])
 
+    def test_unknown_hostname_uses_same_users_other_router(self):
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET hostname='iPhone' WHERE mac='shared' AND router_id='r1'")
+            conn.execute("UPDATE devices SET hostname='unknown', ip='192.168.10.55' WHERE mac='shared' AND router_id='r2'")
+            conn.execute("INSERT INTO devices(mac, router_id, hostname, last_seen) VALUES ('shared','other','Private',99)")
+        row = db.get_device(1, 'shared', 'r2')
+        self.assertEqual((row['known_hostname'], row['ip'], row['router_id']), ('iPhone', '192.168.10.55', 'r2'))
+        self.assertEqual(db.get_user_devices(1, 'r2')[0]['known_hostname'], 'iPhone')
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET hostname='*' WHERE mac='shared' AND router_id='r1'")
+        self.assertIsNone(db.get_device(1, 'shared', 'r2')['known_hostname'])
+
 
 if __name__ == '__main__':
     unittest.main()

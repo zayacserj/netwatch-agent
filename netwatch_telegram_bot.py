@@ -327,7 +327,7 @@ def render_devices_page(chat_id, page=0):
     for device in devices[start:start + DEVICES_PER_PAGE]:
         mac = device["mac"]
         router_id = device["router_id"]
-        name = " ".join((device["custom_name"] or device["hostname"] or mac).split())[:64] or mac
+        name = " ".join((device["custom_name"] or device.get("known_hostname") or mac).split())[:64] or mac
         router_name = " ".join((device["router_name"] or router_id).split())[:64]
         status = "🟢" if device["online"] else "🔴"
         bell = "🔔" if device.get("watch_online", 1) else "🔕"
@@ -382,7 +382,7 @@ async def callback_device_detail(callback: CallbackQuery):
     
     status = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
     watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔕 Уведомления: ВЫКЛ"
-    name = device["custom_name"] or device["hostname"] or "неизвестно"
+    name = device["custom_name"] or device.get("known_hostname") or "неизвестно"
     
     text = (
         f"📱 *Устройство*\n\n"
@@ -477,7 +477,7 @@ async def callback_device_notify(callback: CallbackQuery):
     device = get_device(callback.from_user.id, mac.lower(), router_id)
     if device:
         watch = "🔔 Уведомления: ВКЛ" if device.get("watch_online", 1) else "🔔 Уведомления: ВЫКЛ"
-        name = device["custom_name"] or device["hostname"] or "неизвестно"
+        name = device["custom_name"] or device.get("known_hostname") or "неизвестно"
         stat = "🟢 онлайн" if device["online"] else "🔴 оффлайн"
         text = (
             f"📱 *Устройство*\n\n"

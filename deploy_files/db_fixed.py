@@ -343,10 +343,26 @@ def get_user_by_router_id(router_id, conn=None):
 
 # --- devices ---
 
+_DEVICE_HOSTNAME_SQL = """
+    CASE WHEN lower(trim(d.hostname)) NOT IN ('', '*', 'unknown') THEN trim(d.hostname)
+         ELSE (
+            SELECT trim(other.hostname)
+            FROM devices other
+            JOIN routers owner ON owner.router_id=other.router_id
+            WHERE owner.chat_id=r.chat_id
+              AND other.mac=d.mac COLLATE NOCASE
+              AND lower(trim(other.hostname)) NOT IN ('', '*', 'unknown')
+            ORDER BY other.last_seen DESC, other.router_id
+            LIMIT 1
+         )
+    END AS known_hostname
+"""
+
+
 def get_user_devices(chat_id, router_id=None):
     conn = get_conn()
-    query = """
-        SELECT d.*, r.name AS router_name, r.router_id
+    query = f"""
+        SELECT d.*, r.name AS router_name, r.router_id, {_DEVICE_HOSTNAME_SQL}
         FROM devices d
         JOIN routers r ON d.router_id = r.router_id
         WHERE r.chat_id=?
@@ -382,8 +398,8 @@ def set_device_online(mac, router_id, online=True):
 def get_device(chat_id, mac, router_id):
     """Get single device by MAC and router for user"""
     conn = get_conn()
-    row = conn.execute("""
-        SELECT d.*, r.name AS router_name
+    row = conn.execute(f"""
+        SELECT d.*, r.name AS router_name, {_DEVICE_HOSTNAME_SQL}
         FROM devices d
         JOIN routers r ON d.router_id = r.router_id
         WHERE r.chat_id=? AND d.mac=? AND d.router_id=?

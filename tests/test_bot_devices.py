@@ -49,8 +49,11 @@ class DevicePages(unittest.TestCase):
             device(mac.upper(), 'stale', 0, 30),
             device(mac, 'current', 1, 20),
         ]
+        self.rows[-1].update(hostname='unknown', known_hostname='iPhone')
         text, buttons = self.namespace['render_devices_page'](1)
         self.assertIn('CURRENT', text)
+        self.assertIn('iPhone', text)
+        self.assertNotIn('unknown', text)
         self.assertNotIn('STALE', text)
         self.assertNotIn('OLD', text)
         self.assertEqual([button.callback_data for button in buttons],

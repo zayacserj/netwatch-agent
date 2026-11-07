@@ -22,6 +22,8 @@ if ENV_PATH.exists():
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -39,6 +41,7 @@ from db import (
     create_pairing_code, get_pairing_code, consume_pairing_code,
     delete_router_complete,
     disable_device_notifications, get_notification_settings, toggle_notification_setting,
+    rename_user_router,
 )
 
 logging.basicConfig(
@@ -174,6 +177,10 @@ async def cmd_add_router(message: Message):
 
 
 # --- /routers ---
+class RouterRename(StatesGroup):
+    waiting_for_name = State()
+
+
 @dp.message(Command("routers"))
 async def cmd_routers(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
@@ -187,8 +194,51 @@ async def cmd_routers(message: Message):
         online = fmt_online(r['online'])
         dev_count = get_user_devices_count(message.from_user.id, r['router_id'])
         lines.append(f"• {r['name'] or r['router_id']} — {online} (устройств: {dev_count}, MAC: {r['mac'] or 'н/д'})")
-        builder.button(text=f"🗑 {r['name'] or r['router_id'][:10]}", callback_data=f"del_router_{r['router_id']}")
+        label = r["name"] or r["router_id"]
+        builder.button(text=f"✏️ {label}", callback_data=f"rename_router|{r['router_id']}")
+        builder.button(text=f"🗑 {label}", callback_data=f"del_router_{r['router_id']}")
+    builder.adjust(2)
     await message.reply("\n".join(lines),  reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("rename_router|"))
+async def callback_rename_router(callback: CallbackQuery, state: FSMContext):
+    router_id = callback.data.split("|", 1)[1]
+    router = next(
+        (r for r in get_user_routers(callback.from_user.id) if r["router_id"] == router_id),
+        None,
+    )
+    if router is None:
+        await callback.answer("⛔ Роутер недоступен")
+        return
+    await state.set_data({"router_id": router_id})
+    await state.set_state(RouterRename.waiting_for_name)
+    await callback.answer()
+    await callback.message.answer(
+        f"✏️ Текущее имя: {router['name'] or router_id}\n"
+        "Отправь новое имя одним сообщением, до 64 символов. Для отмены отправь /cancel."
+    )
+
+
+@dp.message(RouterRename.waiting_for_name, Command("cancel"))
+async def cancel_router_rename(message: Message, state: FSMContext):
+    await state.clear()
+    await message.reply("Переименование отменено.")
+
+
+@dp.message(RouterRename.waiting_for_name, F.text & ~F.text.startswith("/"))
+async def save_router_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not 1 <= len(name) <= 64 or not name.isprintable():
+        await message.reply("Введи имя из 1–64 символов в одну строку или отправь /cancel.")
+        return
+    router_id = (await state.get_data()).get("router_id")
+    changed = rename_user_router(message.from_user.id, router_id, name)
+    await state.clear()
+    if changed:
+        await message.reply(f"✅ Новое имя роутера: {name}\nСписок роутеров — /routers")
+    else:
+        await message.reply("Роутер больше недоступен. Открой /routers.")
 
 
 # --- Удаление роутера с подтверждением ---

@@ -286,7 +286,7 @@ def upsert_router(router_id, chat_id, name=None, mac=None, model=None, conn=None
                 # Обновить имя/модель
                 conn.execute("""
                     UPDATE routers SET
-                        name=COALESCE(?, name),
+                        name=COALESCE(NULLIF(name, ''), ?),
                         model=COALESCE(?, model),
                         last_seen=unixepoch()
                     WHERE router_id=?
@@ -298,7 +298,7 @@ def upsert_router(router_id, chat_id, name=None, mac=None, model=None, conn=None
             INSERT INTO routers (router_id, chat_id, name, mac, model, online, last_seen)
             VALUES (?, ?, ?, ?, ?, 0, unixepoch())
             ON CONFLICT(router_id) DO UPDATE SET
-                name=COALESCE(excluded.name, routers.name),
+                name=COALESCE(NULLIF(routers.name, ''), excluded.name),
                 mac=COALESCE(excluded.mac, routers.mac),
                 model=COALESCE(excluded.model, routers.model)
         """, (router_id, chat_id, name, mac, model))
@@ -310,6 +310,14 @@ def get_user_routers(chat_id):
     rows = conn.execute("SELECT * FROM routers WHERE chat_id=? ORDER BY created_at DESC", (chat_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def rename_user_router(chat_id, router_id, name):
+    with db_session() as conn:
+        return conn.execute(
+            "UPDATE routers SET name=? WHERE router_id=? AND chat_id=?",
+            (name, router_id, chat_id),
+        ).rowcount == 1
 
 
 def get_all_routers():

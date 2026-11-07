@@ -49,6 +49,14 @@ class UserDevices(unittest.TestCase):
         self.assertEqual(db.get_user_devices(1, 'missing'), [])
         self.assertEqual(db.get_user_devices(1, "r1' OR 1=1 --"), [])
 
+    def test_router_rename_is_owner_scoped_and_survives_pairing(self):
+        self.assertFalse(db.rename_user_router(2, 'r1', 'Wrong owner'))
+        self.assertTrue(db.rename_user_router(1, 'r1', 'Дом & Wi-Fi'))
+        self.assertEqual(db.upsert_router('r1', 1, name='OpenWrt', mac='aa:bb:cc:dd:ee:ff'), 'r1')
+        self.assertEqual(db.upsert_router('other-id', 1, name='Cudy', mac='aa:bb:cc:dd:ee:ff'), 'r1')
+        self.assertEqual({r['router_name'] for r in db.get_user_devices(1, 'r1')}, {'Дом & Wi-Fi'})
+        self.assertEqual(db.get_user_routers(2)[0]['name'], 'Other')
+
 
 if __name__ == '__main__':
     unittest.main()

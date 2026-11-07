@@ -57,6 +57,12 @@ class UserDevices(unittest.TestCase):
         self.assertEqual({r['router_name'] for r in db.get_user_devices(1, 'r1')}, {'Дом & Wi-Fi'})
         self.assertEqual(db.get_user_routers(2)[0]['name'], 'Other')
 
+    def test_device_rename_requires_owner_and_targets_selected_router(self):
+        self.assertFalse(db.set_device_custom_name('shared', 'r1', 'Denied', chat_id=2))
+        self.assertTrue(db.set_device_custom_name('SHARED', 'r1', 'Колонка', chat_id=1))
+        self.assertEqual(db.get_device(1, 'shared', 'r1')['custom_name'], 'Колонка')
+        self.assertIsNone(db.get_device(1, 'shared', 'r2')['custom_name'])
+
 
 if __name__ == '__main__':
     unittest.main()

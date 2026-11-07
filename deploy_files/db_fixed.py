@@ -392,11 +392,12 @@ def get_device(chat_id, mac, router_id):
     return dict(row) if row else None
 
 
-def set_device_custom_name(mac, router_id, custom_name):
-    conn = get_conn()
-    conn.execute("UPDATE devices SET custom_name=? WHERE mac=? AND router_id=?", (custom_name, mac.lower(), router_id))
-    conn.commit()
-    conn.close()
+def set_device_custom_name(mac, router_id, custom_name, *, chat_id=None):
+    with db_session() as conn:
+        return conn.execute("""
+            UPDATE devices SET custom_name=? WHERE mac=? AND router_id=?
+              AND (? IS NULL OR router_id IN (SELECT router_id FROM routers WHERE chat_id=?))
+        """, (custom_name, mac.lower(), router_id, chat_id, chat_id)).rowcount == 1
 
 
 def toggle_device_watch_online(mac, router_id):

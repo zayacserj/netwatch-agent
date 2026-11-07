@@ -69,3 +69,69 @@ class DevicePages(unittest.TestCase):
         self.assertEqual([button.callback_data for button in second_buttons],
                          ['device_detail|aa:bb:cc:dd:ee:0a|r', 'device_page|0'])
         self.assertEqual(render(1, 99)[0], second)
+
+
+class DeviceRename(unittest.TestCase):
+    def test_callback_and_reply_pass_the_saved_target_to_the_owner_scoped_update(self):
+        path = Path(__file__).resolve().parents[1] / 'netwatch_telegram_bot.py'
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        handlers = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                    and node.name in ('callback_device_rename', 'save_device_name')]
+        for node in handlers:
+            node.decorator_list = []
+            for arg in node.args.args:
+                arg.annotation = None
+
+        writes, replies = [], []
+
+        async def reply(text=None):
+            replies.append(text)
+
+        class State:
+            data = None
+            value = None
+
+            async def set_data(self, data):
+                self.data = data
+
+            async def set_state(self, value):
+                self.value = value
+
+            async def get_data(self):
+                return self.data
+
+            async def clear(self):
+                self.data = self.value = None
+
+        def rename(mac, router, name, *, chat_id):
+            writes.append((mac, router, name, chat_id))
+            return True
+
+        namespace = dict(
+            DeviceRename=SimpleNamespace(waiting_for_name='device name'),
+            get_device=lambda chat_id, mac, router: {'mac': mac.lower()} if chat_id == 1 else None,
+            set_device_custom_name=rename,
+        )
+        exec(compile(ast.Module(body=handlers, type_ignores=[]), str(path), 'exec'), namespace)
+
+        def run(coro):
+            with self.assertRaises(StopIteration):
+                coro.send(None)
+
+        user = SimpleNamespace(id=1)
+        state = State()
+        callback = SimpleNamespace(
+            data='device_rename|AA:BB:CC:DD:EE:FF|r2', from_user=user,
+            answer=reply, message=SimpleNamespace(answer=reply),
+        )
+        run(namespace['callback_device_rename'](callback, state))
+        self.assertEqual(state.value, 'device name')
+        message = SimpleNamespace(from_user=user, text='  ', reply=reply)
+        run(namespace['save_device_name'](message, state))
+        self.assertEqual(writes, [])
+        self.assertEqual(state.value, 'device name')
+        message.text = '  Колонка  '
+        run(namespace['save_device_name'](message, state))
+        self.assertEqual(writes, [('aa:bb:cc:dd:ee:ff', 'r2', 'Колонка', 1)])
+        self.assertIsNone(state.value)
+        self.assertIn('Колонка', replies[-1])

@@ -413,25 +413,53 @@ async def callback_device_back(callback: CallbackQuery):
 
 
 # --- Device rename: ask for new name ---
+class DeviceRename(StatesGroup):
+    waiting_for_name = State()
+
+
 @dp.callback_query(F.data.startswith("device_rename|"))
-async def callback_device_rename(callback: CallbackQuery):
-    parts = callback.data.split("|")
-    mac = parts[1]
-    router_id = parts[2]
-    
-    device = get_device(callback.from_user.id, mac.lower(), router_id)
+async def callback_device_rename(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("|", 2)
+    if len(parts) != 3:
+        await callback.answer("Устройство недоступно")
+        return
+    _, mac, router_id = parts
+    device = get_device(callback.from_user.id, mac, router_id)
     if not device:
         await callback.answer("⛔ Нет доступа")
         return
-    
-    await callback.message.edit_text(
-        f"✏️ Введите новое имя для устройства `{mac}`:\n\n"
-        f"Отправьте сообщение с новым именем.",
-        
-    )
-    # Store state: user is waiting to rename this device
-    callback.from_user._pending_rename = {"mac": mac, "router_id": router_id}
+
+    await state.set_data({"mac": device["mac"], "router_id": router_id})
+    await state.set_state(DeviceRename.waiting_for_name)
     await callback.answer()
+    await callback.message.answer(
+        f"✏️ Введите новое имя для устройства {device['mac']}.\n"
+        "Отправьте имя одной строкой, до 64 символов, или /cancel для отмены."
+    )
+
+
+@dp.message(DeviceRename.waiting_for_name, Command("cancel"))
+async def cancel_device_rename(message: Message, state: FSMContext):
+    await state.clear()
+    await message.reply("Переименование отменено.")
+
+
+@dp.message(DeviceRename.waiting_for_name, F.text & ~F.text.startswith("/"))
+async def save_device_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not 1 <= len(name) <= 64 or not name.isprintable():
+        await message.reply("Введите имя из 1–64 символов в одну строку или /cancel.")
+        return
+
+    data = await state.get_data()
+    changed = set_device_custom_name(
+        data["mac"], data["router_id"], name, chat_id=message.from_user.id,
+    )
+    await state.clear()
+    if changed:
+        await message.reply(f"✅ Новое имя устройства: {name}\nОбновить список — /devices")
+    else:
+        await message.reply("Устройство больше недоступно. Откройте /devices.")
 
 
 # --- Device toggle notifications ---
@@ -466,28 +494,6 @@ async def callback_device_notify(callback: CallbackQuery):
         builder.button(text="◀ Назад к списку", callback_data="device_back_list")
         builder.adjust(2, 1)
         await callback.message.edit_text(text,  reply_markup=builder.as_markup())
-
-
-# --- Handle text input for rename ---
-@dp.message(F.text & ~F.text.startswith("/"))
-async def handle_pending_rename(message: Message):
-    user = message.from_user
-    pending = getattr(user, "_pending_rename", None)
-    if not pending:
-        return
-    
-    mac = pending["mac"]
-    router_id = pending["router_id"]
-    new_name = message.text.strip()
-    
-    if not new_name:
-        await message.reply("❌ Имя не может быть пустым")
-        return
-    
-    set_device_custom_name(mac, router_id, new_name)
-    user._pending_rename = None
-    
-    await message.reply(f"✅ Устройство `{mac}` переименовано в *{new_name}*", )
 
 
 # --- /settings ---

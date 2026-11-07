@@ -61,9 +61,13 @@ sys.exit(int(os.environ.get('CURL_EXIT','0')))
         mac.write_text('AA:BB:CC:DD:EE:FF\n')
         model = self.root / 'model'
         model.write_text('Cudy "Router"\nSecond line', newline='\n')
+        self.ca_bundle = self.root / 'ca-bundle.crt'
+        self.ca_bundle.write_text('test CA bundle')
         source = AGENT.read_text(encoding='utf-8')
         for old, path in (('/etc/netwatch', self.state), ('/etc/crontabs/root', self.cron),
                           ('/tmp/netwatch-install.lock', self.lock),
+                          ('/etc/openwrt_release', model),
+                          ('/etc/ssl/certs/ca-certificates.crt', self.ca_bundle),
                           ('/proc/sys/kernel/random/uuid', uuid),
                           ('/sys/class/net/br-lan/address', mac),
                           ('/sys/class/net/eth0/address', self.root / 'missing-mac'),

@@ -92,8 +92,8 @@ def _agent_install_command(code, url):
     from shlex import quote
     from urllib.parse import urlsplit
 
-    release_ref = "0ede2c802ccdee358fd961cf571e9a4d9c9c5d09"
-    agent_sha256 = "f922ad67d45c8df779bac4a58b885622207ca1a80a4da3e93701f7d8219af697"
+    release_ref = "d91fe81ab4997c5c584545bf3c4d4dcf5aa6e59b"
+    agent_sha256 = "be9cc6e8e9b51ae92b45a11e9586aeb2da159bcc357d4dfe7d5deceb04b65b4f"
     if (not isinstance(code, str) or len(code) != 8
             or any(c not in "0123456789abcdefABCDEF" for c in code)):
         raise ValueError("Invalid pairing code")
@@ -123,32 +123,28 @@ def _agent_install_command(code, url):
         "  set -e\n"
         "  umask 077\n"
         "  [ -r /etc/openwrt_release ] && [ \"$(id -u)\" = 0 ] || { echo 'Run as root on OpenWrt' >&2; exit 1; }\n"
-        "  nw_packages=\n"
-        "  for nw_tool in curl jq iw iwinfo; do\n"
-        "    command -v \"$nw_tool\" >/dev/null 2>&1 || nw_packages=\"$nw_packages $nw_tool\"\n"
-        "  done\n"
-        "  if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then\n"
-        "    nw_packages=\"$nw_packages ca-bundle\"\n"
-        "  fi\n"
-        "  if [ -n \"$nw_packages\" ]; then\n"
-        "    echo \"Installing OpenWrt packages:$nw_packages\"\n"
-        "    if command -v apk >/dev/null 2>&1; then\n"
-        "      apk update && apk add $nw_packages || exit 1\n"
-        "    elif command -v opkg >/dev/null 2>&1; then\n"
-        "      opkg update && opkg install $nw_packages || exit 1\n"
-        "    else\n"
-        "      echo 'No supported OpenWrt package manager found' >&2; exit 1\n"
-        "    fi\n"
-        "  fi\n"
-        "  for nw_tool in curl jq iw iwinfo crontab logger sha256sum awk cmp; do\n"
-        "    command -v \"$nw_tool\" >/dev/null 2>&1 || { echo \"Missing dependency: $nw_tool\" >&2; exit 1; }\n"
-        "  done\n"
         "  nw_install_dir=$(mktemp -d /tmp/netwatch-install.XXXXXX)\n"
-        "  trap 'rm -f \"$nw_install_dir/agent.sh\"; rmdir \"$nw_install_dir\" 2>/dev/null || true' 0\n"
-        f"  curl --disable --fail --silent --show-error --connect-timeout 5 --max-time 30 --proto '=https' {quote(source)} --output \"$nw_install_dir/agent.sh\"\n"
-        f"  printf '%s  %s\\n' {quote(agent_sha256)} \"$nw_install_dir/agent.sh\" | sha256sum -c -\n"
-        "  sh -n \"$nw_install_dir/agent.sh\"\n"
-        f"  sh \"$nw_install_dir/agent.sh\" pair --code {quote(code)} --url {quote(url)}\n"
+        "  agent=\"$nw_install_dir/agent.sh\"\n"
+        "  trap 'rm -f \"$agent\"; rmdir \"$nw_install_dir\" 2>/dev/null || true' 0\n"
+        f"  source={quote(source)}\n"
+        "\n"
+        "  download() { curl --disable -fsS --max-time 30 --proto '=https' -o \"$agent\" \"$source\"; }\n"
+        "  if command -v curl >/dev/null 2>&1 && [ -s /etc/ssl/certs/ca-certificates.crt ]; then\n"
+        "    download\n"
+        "  elif command -v uclient-fetch >/dev/null 2>&1 && uclient-fetch -q -T 30 -O \"$agent\" \"$source\"; then\n"
+        "    :\n"
+        "  else\n"
+        "    if command -v apk >/dev/null 2>&1; then\n"
+        "      apk update && apk add curl ca-bundle || exit 1\n"
+        "    else\n"
+        "      opkg update && opkg install curl ca-bundle || exit 1\n"
+        "    fi\n"
+        "    download\n"
+        "  fi\n"
+        "\n"
+        f"  printf '%s  %s\\n' {quote(agent_sha256)} \"$agent\" | sha256sum -c -\n"
+        "  sh -n \"$agent\"\n"
+        f"  sh \"$agent\" pair --install-deps --code {quote(code)} --url {quote(url)}\n"
         ")"
     )
 
@@ -165,12 +161,11 @@ async def cmd_add_router(message: Message):
         return
 
     text = (
-        f"🔐 Код подключения роутера: `{code}`\n"
-        "Действует 15 минут. Выполните весь блок от root на OpenWrt.\n"
-        "Блок установит недостающие пакеты из репозиториев OpenWrt. Нужны интернет и свободное место.\n\n"
-        f"🌐 Установка на OpenWrt — одинаковая для домашней сети и интернета:\n```\n{install_command}\n```\n"
+        "📡 *Подключение роутера NetWatch*\n\n"
+        "Скопируйте весь блок в терминал OpenWrt под root. Код действует 15 минут.\n\n"
+        f"```\n{install_command}\n```\n"
     )
-    text += "\nСуществующая рабочая привязка и задания других программ сохраняются."
+    text += "\nАгент установит недостающие пакеты и сохранит действующую привязку."
     create_pairing_code(code, message.from_user.id, expires_sec=900)
     await message.reply(text, parse_mode="Markdown")
 

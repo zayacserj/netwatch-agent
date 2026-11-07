@@ -22,6 +22,7 @@ command() {
     [ "$1" = -v ] || return 1
     case "$2" in
         apk|opkg) [ "$2" = "$MOCK_PACKAGE_MANAGER" ]; return ;;
+        uclient-fetch) [ "$MOCK_UCLIENT" = 1 ]; return ;;
         curl|jq|iw|iwinfo)
             case " $MOCK_MISSING " in
                 *" $2 "*) [ "$packages_installed" = yes ]; return ;;
@@ -89,8 +90,8 @@ class BotInstallation(unittest.TestCase):
         self.assertNotIn('/main/', command)
         digest = hashlib.sha256((ROOT / 'deploy_files/agent3_fixed.sh').read_bytes()).hexdigest()
         self.assertIn(digest, command)
-        self.assertLess(command.index('sha256sum -c -'), command.index(' pair --code '))
-        self.assertIn('--fail', command)
+        self.assertLess(command.index('sha256sum -c -'), command.index(' pair --install-deps --code '))
+        self.assertIn('-fsS', command)
         self.assertIn('--disable', command)
         self.assertNotIn(' -k ', command)
 
@@ -100,7 +101,7 @@ class BotInstallation(unittest.TestCase):
         self.assertIn('```\n(\n', text)
         self.assertEqual(len(self.codes), 1)
         self.assertEqual(self.codes[0], (('11223344', 1), {'expires_sec': 900}))
-        self.assertEqual(text.count('pair --code 11223344'), 1)
+        self.assertEqual(text.count('pair --install-deps --code 11223344'), 1)
         self.assertNotIn('192.168.10.222', text)
 
     def test_single_canonical_command_ignores_legacy_local_address(self):
@@ -108,7 +109,7 @@ class BotInstallation(unittest.TestCase):
         self.assertIn('--url https://api.example.invalid', text)
         self.assertLessEqual(len(text), 4096)
         self.assertEqual(len(self.codes), 1)
-        self.assertEqual(text.count('pair --code 11223344'), 1)
+        self.assertEqual(text.count('pair --install-deps --code 11223344'), 1)
         other, _ = self.render(url='https://api.example.invalid', legacy='http://192.168.99.99:8080')
         self.assertEqual(text, other)
 
@@ -149,7 +150,7 @@ class BotInstallation(unittest.TestCase):
         return [SHELL, 'sh'] if 'busybox' in Path(SHELL).name.lower() else [SHELL]
 
     def bootstrap(self, artifact, *, correct_hash=True, curl_exit='0', url='https://pi.invalid:8080',
-                  package_manager='', missing='', missing_ca=False, install_fail=False):
+                  package_manager='', missing='', missing_ca=False, install_fail=False, uclient=False):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as name:
             folder = Path(name)
             download = folder / 'artifact.sh'
@@ -163,18 +164,20 @@ class BotInstallation(unittest.TestCase):
             mock = '''curl() {
     [ "$CURL_EXIT" = 0 ] || return "$CURL_EXIT"
     while [ "$#" -gt 0 ]; do
-        if [ "$1" = --output ]; then cp "$ARTIFACT" "$2"; return; fi
+        case "$1" in -o|-O) cp "$ARTIFACT" "$2"; return ;; esac
         shift
     done
     return 99
 }
+uclient-fetch() { curl "$@"; }
 '''
             result = subprocess.run(self.shell() + ['-c', OPENWRT + mock + mock_openwrt_paths(command, missing_ca)],
                                     capture_output=True, text=True,
                                     env=dict(os.environ, CURL_EXIT=curl_exit, ARTIFACT=download.as_posix(),
                                              PAIR_MARKER=marker.as_posix(),
                                              MOCK_PACKAGE_MANAGER=package_manager, MOCK_MISSING=missing,
-                                             MOCK_INSTALL_FAIL=str(int(install_fail))), timeout=15)
+                                             MOCK_INSTALL_FAIL=str(int(install_fail)),
+                                             MOCK_UCLIENT=str(int(uclient))), timeout=15)
             args = marker.read_text().splitlines() if marker.exists() else None
             # Linux can unlink a script just executed by a child shell;
             # busybox-w32 may retain its handle until the parent unwinds.
@@ -186,21 +189,44 @@ class BotInstallation(unittest.TestCase):
         url = 'https://pi.invalid/path;literal'
         result, args = self.bootstrap('printf "%s\\n" "$@" > "$PAIR_MARKER"\n', url=url)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(args, ['pair', '--code', '11223344', '--url', url])
+        self.assertEqual(args, ['pair', '--install-deps', '--code', '11223344', '--url', url])
         self.assertEqual(result.stderr, '')
 
     def test_missing_tools_are_installed_before_pairing(self):
+        from test_agent_installation import Installation
         for manager, verb in (('apk', 'add'), ('opkg', 'install')):
             for missing, missing_ca in (('curl jq iw iwinfo', True), ('jq', False), ('', False)):
                 with self.subTest(manager=manager, missing=missing):
-                    result, args = self.bootstrap('printf "%s\\n" "$@" > "$PAIR_MARKER"\n',
-                                                  package_manager=manager, missing=missing,
-                                                  missing_ca=missing_ca)
+                    fixture = Installation()
+                    fixture.setUp()
+                    self.addCleanup(fixture.doCleanups)
+                    fixture.agent.write_text(OPENWRT + fixture.prefix + fixture.source,
+                                             encoding='utf-8', newline='\n')
+                    if missing_ca:
+                        fixture.ca_bundle.unlink()
+                    result = fixture.run_agent(
+                        'pair', '--install-deps', '--code', '11223344', '--url', 'https://pi.invalid',
+                        MOCK_PACKAGE_MANAGER=manager, MOCK_MISSING=missing,
+                    )
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertIsNotNone(args)
+                    self.assertEqual(len(fixture.requests()), 1)
                     packages = missing + (' ca-bundle' if missing_ca else '')
                     expected = [f'{manager} update', f'{manager} {verb} {packages}'] if packages else []
                     self.assertEqual(result.stderr.splitlines(), expected)
+
+    def test_bootstrap_downloads_without_curl(self):
+        artifact = 'echo executed > "$PAIR_MARKER"\n'
+        for manager, verb in (('apk', 'add'), ('opkg', 'install')):
+            result, args = self.bootstrap(artifact, missing='curl', uclient=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(args, ['executed'])
+            self.assertEqual(result.stderr, '')
+            result, args = self.bootstrap(artifact, package_manager=manager, missing='curl')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(args, ['executed'])
+            self.assertEqual(result.stderr.splitlines(), [
+                f'{manager} update', f'{manager} {verb} curl ca-bundle',
+            ])
 
     def test_package_failure_stops_before_pairing(self):
         result, args = self.bootstrap('echo executed > "$PAIR_MARKER"\n',
@@ -235,7 +261,7 @@ class BotInstallation(unittest.TestCase):
         command = command.replace('/tmp/netwatch-install.XXXXXX', (fixture.root / 'download.XXXXXX').as_posix())
         mock = '''curl() {
     while [ "$#" -gt 0 ]; do
-        if [ "$1" = --output ]; then cp "$ARTIFACT" "$2"; return; fi
+        if [ "$1" = -o ]; then cp "$ARTIFACT" "$2"; return; fi
         shift
     done
     return 99

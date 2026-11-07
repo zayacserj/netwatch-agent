@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import hashlib
+from html import unescape
 import os
 from pathlib import Path
 import re
@@ -97,8 +98,11 @@ class BotInstallation(unittest.TestCase):
 
     def test_universal_command_is_rendered_as_copyable_code(self):
         text, kwargs = self.render()
-        self.assertEqual(kwargs['parse_mode'], 'Markdown')
-        self.assertIn('```\n(\n', text)
+        self.assertEqual(kwargs['parse_mode'], 'HTML')
+        self.assertIn('<b>📡 Подключение роутера NetWatch</b>', text)
+        block = text.split('<pre>', 1)[1].split('</pre>', 1)[0]
+        self.assertIn('&amp;&amp;', block)
+        self.assertEqual(unescape(block), self.command('11223344', 'https://netwatchagent.example'))
         self.assertEqual(len(self.codes), 1)
         self.assertEqual(self.codes[0], (('11223344', 1), {'expires_sec': 900}))
         self.assertEqual(text.count('pair --install-deps --code 11223344'), 1)

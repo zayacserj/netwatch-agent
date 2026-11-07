@@ -151,6 +151,8 @@ def _agent_install_command(code, url):
 
 @dp.message(Command("add_router"))
 async def cmd_add_router(message: Message):
+    from html import escape
+
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     code = secrets.token_hex(4)
     api_url = os.getenv("PI_URL_PUBLIC", "")
@@ -161,13 +163,13 @@ async def cmd_add_router(message: Message):
         return
 
     text = (
-        "📡 *Подключение роутера NetWatch*\n\n"
+        "<b>📡 Подключение роутера NetWatch</b>\n\n"
         "Скопируйте весь блок в терминал OpenWrt под root. Код действует 15 минут.\n\n"
-        f"```\n{install_command}\n```\n"
+        f"<pre>{escape(install_command, quote=False)}</pre>\n"
     )
     text += "\nАгент установит недостающие пакеты и сохранит действующую привязку."
     create_pairing_code(code, message.from_user.id, expires_sec=900)
-    await message.reply(text, parse_mode="Markdown")
+    await message.reply(text, parse_mode="HTML")
 
 
 # --- /routers ---

@@ -38,6 +38,7 @@ from db import (
     get_latest_health, get_user_health, add_health_check,
     create_pairing_code, get_pairing_code, consume_pairing_code,
     delete_router_complete,
+    disable_device_notifications, get_notification_settings, toggle_notification_setting,
 )
 
 logging.basicConfig(
@@ -92,8 +93,8 @@ def _agent_install_command(code, url):
     from shlex import quote
     from urllib.parse import urlsplit
 
-    release_ref = "d91fe81ab4997c5c584545bf3c4d4dcf5aa6e59b"
-    agent_sha256 = "be9cc6e8e9b51ae92b45a11e9586aeb2da159bcc357d4dfe7d5deceb04b65b4f"
+    release_ref = "82221b18ae1b8c17c2ab4d18549d46a6381f76d3"
+    agent_sha256 = "2b5763f77db64abcd4f788045d1a8f66b0283868ad75a8426abc2f2b33b5ae04"
     if (not isinstance(code, str) or len(code) != 8
             or any(c not in "0123456789abcdefABCDEF" for c in code)):
         raise ValueError("Invalid pairing code")
@@ -421,18 +422,46 @@ async def handle_pending_rename(message: Message):
 
 
 # --- /settings ---
+def notification_settings_keyboard(chat_id):
+    settings = get_notification_settings(chat_id)
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🔕 Отключить онлайн/оффлайн у всех устройств",
+        callback_data="notify_settings|disable_devices",
+    )
+    for key, label in (("podkop", "🔀 Podkop: смена прокси"), ("router", "📡 Статус роутеров")):
+        state = "ВКЛ" if settings[key] else "ВЫКЛ"
+        builder.button(text=f"{label} · {state}", callback_data=f"notify_settings|{key}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    devices = get_user_devices(message.from_user.id)
-    if not devices:
-        await message.reply("📭 Нет устройств для настройки.")
+    await message.reply(
+        "⚙️ Уведомления NetWatch\n\n"
+        "О новых устройствах бот сообщает всегда. "
+        "Уведомления отдельных устройств можно включить в /devices.",
+        reply_markup=notification_settings_keyboard(message.from_user.id),
+    )
+
+
+@dp.callback_query(F.data.startswith("notify_settings|"))
+async def callback_notification_settings(callback: CallbackQuery):
+    user = callback.from_user
+    action = callback.data.split("|", 1)[1]
+    if action == "disable_devices":
+        count = disable_device_notifications(user.id)
+        await callback.answer(f"Отключены уведомления у устройств: {count}")
         return
-    builder = InlineKeyboardBuilder()
-    for d in devices:
-        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
-        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify|{d['mac']}|{d['router_id']}")
-    await message.reply("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
+    if action not in ("podkop", "router"):
+        await callback.answer("Настройка недоступна")
+        return
+    upsert_user(user.id, user.username, user.first_name)
+    enabled = toggle_notification_setting(user.id, action)
+    await callback.answer("Уведомления включены" if enabled else "Уведомления отключены")
+    await callback.message.edit_reply_markup(reply_markup=notification_settings_keyboard(user.id))
 
 
 # --- Toggle notifications (from /settings) ---
@@ -451,14 +480,10 @@ async def callback_toggle_notify(callback: CallbackQuery):
     status = "ВКЛ" if new_val else "ВЫКЛ"
     await callback.answer(f"Уведомления {status}")
     
-    # Refresh settings list
-    devices = get_user_devices(callback.from_user.id)
-    builder = InlineKeyboardBuilder()
-    for d in devices:
-        watch = "🔔 Отключить" if d.get("watch_online", 1) else "🔔 Включить"
-        builder.button(text=f"{d['mac']} — {watch}", callback_data=f"toggle_notify|{d['mac']}|{d['router_id']}")
-    builder.adjust(1)
-    await callback.message.edit_text("⚙️ Настройка уведомлений:", reply_markup=builder.as_markup())
+    await callback.message.edit_text(
+        "⚙️ Уведомления NetWatch",
+        reply_markup=notification_settings_keyboard(callback.from_user.id),
+    )
 
 
 # --- /guide ---

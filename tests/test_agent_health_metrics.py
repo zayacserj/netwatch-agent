@@ -236,5 +236,6 @@ curl() {
         data = json.loads(payload.read_text())
         self.assertEqual((data['podkop_status'], data['podkop_test'], data['podkop_latency_ms']),
                          ('running', 1, 159))
+        self.assertEqual(data['podkop_proxy_tag'], 'main-1-out')
         self.assertEqual(data['cpu'], '50.0%')
         self.assertEqual(data['ram'], '128MiB/512MiB')

@@ -61,6 +61,8 @@ def init_db():
             model TEXT,
             online INTEGER DEFAULT 0,
             last_seen INTEGER DEFAULT (unixepoch()),
+            podkop_proxy_tag TEXT,
+            podkop_proxy_sample_at INTEGER,
             created_at INTEGER DEFAULT (unixepoch()),
             FOREIGN KEY (chat_id) REFERENCES users(chat_id)
         );
@@ -119,6 +121,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_settings (
             chat_id INTEGER PRIMARY KEY,
             watch_online INTEGER DEFAULT 1,
+            watch_podkop_proxy INTEGER NOT NULL DEFAULT 0,
+            watch_router_online INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
         );
 
@@ -136,6 +140,17 @@ def init_db():
 
     # Миграция: добавить новые колонки если таблица уже существует
     with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        settings_columns = {col["name"] for col in conn.execute("PRAGMA table_info(user_settings)")}
+        if "watch_podkop_proxy" not in settings_columns:
+            conn.execute("ALTER TABLE user_settings ADD COLUMN watch_podkop_proxy INTEGER NOT NULL DEFAULT 0")
+        if "watch_router_online" not in settings_columns:
+            conn.execute("ALTER TABLE user_settings ADD COLUMN watch_router_online INTEGER NOT NULL DEFAULT 0")
+        router_columns = {col["name"] for col in conn.execute("PRAGMA table_info(routers)")}
+        if "podkop_proxy_tag" not in router_columns:
+            conn.execute("ALTER TABLE routers ADD COLUMN podkop_proxy_tag TEXT")
+        if "podkop_proxy_sample_at" not in router_columns:
+            conn.execute("ALTER TABLE routers ADD COLUMN podkop_proxy_sample_at INTEGER")
         health_columns = [col["name"] for col in conn.execute("PRAGMA table_info(health_checks)").fetchall()]
         if "podkop_latency_ms" not in health_columns:
             conn.execute("ALTER TABLE health_checks ADD COLUMN podkop_latency_ms INTEGER")
@@ -215,6 +230,44 @@ def clean_user_data(chat_id):
     conn.execute("DELETE FROM users WHERE chat_id=?", (chat_id,))
     conn.commit()
     conn.close()
+
+
+# --- notification settings ---
+
+_NOTIFICATION_COLUMNS = {
+    "podkop": "watch_podkop_proxy",
+    "router": "watch_router_online",
+}
+
+
+def get_notification_settings(chat_id):
+    with db_session() as conn:
+        row = conn.execute("""
+            SELECT watch_podkop_proxy, watch_router_online
+            FROM user_settings WHERE chat_id=?
+        """, (chat_id,)).fetchone()
+    return {key: bool(row and row[column]) for key, column in _NOTIFICATION_COLUMNS.items()}
+
+
+def toggle_notification_setting(chat_id, key):
+    column = _NOTIFICATION_COLUMNS[key]
+    with db_session() as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (chat_id) VALUES (?)", (chat_id,))
+        row = conn.execute(f"""
+            UPDATE user_settings SET {column}=1-{column}
+            WHERE chat_id=? RETURNING {column}
+        """, (chat_id,)).fetchone()
+        return bool(row[column])
+
+
+def disable_device_notifications(chat_id):
+    with db_session() as conn:
+        return conn.execute("""
+            UPDATE devices SET watch_online=0
+            WHERE watch_online=1 AND router_id IN (
+                SELECT router_id FROM routers WHERE chat_id=?
+            )
+        """, (chat_id,)).rowcount
 
 
 # --- routers ---

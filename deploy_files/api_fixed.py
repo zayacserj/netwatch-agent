@@ -29,13 +29,13 @@ from aiohttp import web
 
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router,
-    is_valid_router_secret, get_user_by_router_id,
     can_notify_device, mark_device_notified, init_db, db_session
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
+ROUTER_OFFLINE_AFTER = 7 * 60
 
 # --- Telegram notification helper ---
 def send_telegram_notification(chat_id, text):
@@ -66,9 +66,38 @@ async def auth_middleware(request, handler):
         return await handler(request)
 
     secret = request.headers.get("X-Agent-Secret")
-    if not secret or not is_valid_router_secret(secret):
+    if not secret:
         return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
+    with db_session() as conn:
+        router = conn.execute(
+            "SELECT router_id FROM router_secrets WHERE secret=?", (secret,)
+        ).fetchone()
+    if router is None:
+        return web.json_response({"error": "Forbidden: invalid agent secret"}, status=403)
+    if request.method == "POST" and request.path in ("/event", "/devices", "/health"):
+        try:
+            data = await request.json()
+        except (ValueError, UnicodeError):
+            return web.json_response({"error": "Bad JSON"}, status=400)
+        if not isinstance(data, dict) or "router_id" not in data:
+            return web.json_response({"error": "Missing router_id"}, status=400)
+        if data["router_id"] != router["router_id"]:
+            return web.json_response({"error": "Forbidden: wrong router"}, status=403)
     return await handler(request)
+
+
+def record_router_report(conn, router_id, notifications):
+    router = conn.execute("""
+        SELECT r.name, r.chat_id, r.online, r.podkop_proxy_tag, r.podkop_proxy_sample_at,
+               s.watch_podkop_proxy, s.watch_router_online
+        FROM routers r LEFT JOIN user_settings s ON s.chat_id=r.chat_id
+        WHERE r.router_id=?
+    """, (router_id,)).fetchone()
+    if router is not None:
+        conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (router_id,))
+        if not router["online"] and router["watch_router_online"]:
+            notifications.append((router["chat_id"], f"🟢 Роутер онлайн: {router['name'] or router_id}"))
+    return router
 
 # --- POST /event ---
 async def post_event(request):
@@ -91,7 +120,8 @@ async def post_event(request):
                      (data["router_id"], mac, event, timestamp))
 
         # Получаем chat_id пользователя этого роутера
-        chat_id = get_user_by_router_id(data["router_id"], conn=conn)
+        router = record_router_report(conn, data["router_id"], notifications)
+        chat_id = router["chat_id"] if router else None
 
         # Обновляем состояние устройства
         now = int(time.time())
@@ -119,7 +149,8 @@ async def post_event(request):
                                or data.get("hostname") or (prev["hostname"] if prev else None) or mac)
                 if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
                     mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
-                    notifications.append((chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}"))
+                    label = "🆕 Новое устройство" if prev is None else "🟢 Устройство онлайн"
+                    notifications.append((chat_id, f"{label}: `{mac}` — {device_name}"))
 
         elif "DISCONNECTED" in event_upper:
             # Проверяем предыдущий статус
@@ -157,8 +188,10 @@ async def post_devices(request):
 
     notifications = []
     with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         now = int(time.time())
-        chat_id = get_user_by_router_id(data["router_id"], conn=conn)
+        router = record_router_report(conn, data["router_id"], notifications)
+        chat_id = router["chat_id"] if router else None
 
         saved = 0
         new_devices = []
@@ -217,6 +250,7 @@ async def post_health(request):
     if latency is not None and (type(latency) is not int or not 0 <= latency <= 60000):
         return web.json_response({"error": "Invalid proxy latency"}, status=400)
 
+    notifications = []
     with db_session() as conn:
         timestamp = data.get("timestamp", int(time.time()))
         conn.execute("""
@@ -230,8 +264,23 @@ async def post_health(request):
               None if data["podkop_test"] is None else (1 if data["podkop_test"] else 0),
               timestamp, latency))
 
-        # Обновляем last_seen роутера
-        conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (data["router_id"],))
+        router_id = data["router_id"]
+        router = record_router_report(conn, router_id, notifications)
+        proxy_tag = data.get("podkop_proxy_tag")
+        if (router and data["podkop_status"] == "running"
+                and isinstance(proxy_tag, str) and 0 < len(proxy_tag) <= 200 and proxy_tag.isprintable()
+                and type(timestamp) is int and timestamp > 0
+                and (router["podkop_proxy_sample_at"] is None or timestamp > router["podkop_proxy_sample_at"])):
+            previous = router["podkop_proxy_tag"]
+            conn.execute("""
+                UPDATE routers SET podkop_proxy_tag=?, podkop_proxy_sample_at=? WHERE router_id=?
+            """, (proxy_tag, timestamp, router_id))
+            if previous and previous != proxy_tag and router["watch_podkop_proxy"]:
+                name = router["name"] or router_id
+                notifications.append((router["chat_id"], f"🔀 Podkop сменил прокси на {name}\n{previous} → {proxy_tag}"))
+
+    for chat_id, text in notifications:
+        send_telegram_notification(chat_id, text)
 
     return web.json_response({"status": "ok", "saved": True})
 
@@ -328,8 +377,21 @@ async def check_offline_devices(app):
         try:
             notifications = []
             with db_session() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 now = int(time.time())
                 threshold = now - 120  # 2 minutes
+                stale_routers = conn.execute("""
+                    UPDATE routers SET online=0
+                    WHERE online=1 AND last_seen < ?
+                    RETURNING router_id, name, chat_id
+                """, (now - ROUTER_OFFLINE_AFTER,)).fetchall()
+                for router in stale_routers:
+                    setting = conn.execute("""
+                        SELECT watch_router_online FROM user_settings WHERE chat_id=?
+                    """, (router["chat_id"],)).fetchone()
+                    if setting and setting["watch_router_online"]:
+                        name = router["name"] or router["router_id"]
+                        notifications.append((router["chat_id"], f"🔴 Роутер оффлайн: {name}"))
 
                 # Update status for every stale device; watch_online controls messages only.
                 stale_devices = conn.execute("""

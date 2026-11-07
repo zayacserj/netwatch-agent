@@ -222,6 +222,88 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.count('health_checks'), 1)
         self.assertTrue(all(c.closed for c in self.connections))
 
+    def test_bulk_disable_only_changes_owned_devices_and_keeps_discovery(self):
+        self.seed_device(online=0)
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO users(chat_id) VALUES (2)")
+            conn.execute("INSERT INTO routers(router_id,chat_id) VALUES ('other',2)")
+            conn.execute("INSERT INTO devices(mac,router_id) VALUES ('aa','other')")
+
+        self.assertEqual(db.disable_device_notifications(1), 1)
+        self.assertEqual(db.disable_device_notifications(1), 0)
+        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}, {'mac': 'bb'}]))
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('Новое устройство: `bb`', self.sent[0][1])
+        with db.db_session() as conn:
+            self.assertEqual(conn.execute("SELECT watch_online FROM devices WHERE router_id='other'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT online, watch_online FROM devices WHERE router_id='r' AND mac='aa'").fetchone()[:], (1, 0))
+
+    def test_settings_migration_keeps_existing_preferences(self):
+        self.seed_device(watch=0)
+        with db.db_session() as conn:
+            conn.execute("ALTER TABLE user_settings DROP COLUMN watch_podkop_proxy")
+            conn.execute("ALTER TABLE user_settings DROP COLUMN watch_router_online")
+            conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_tag")
+            conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_sample_at")
+            conn.execute("INSERT INTO user_settings(chat_id, watch_online) VALUES (1, 0)")
+        db.init_db()
+        db.init_db()
+        self.assertEqual(db.get_notification_settings(1), {'podkop': False, 'router': False})
+        with db.db_session() as conn:
+            self.assertEqual(conn.execute("SELECT watch_online FROM user_settings WHERE chat_id=1").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT watch_online FROM devices WHERE router_id='r'").fetchone()[0], 0)
+
+    def test_proxy_alert_uses_last_valid_tag_and_respects_setting(self):
+        def report(tag, timestamp, status='running'):
+            self.run_handler('post_health', dict(router_id='r', internet=True, wifi=True,
+                             cpu='1%', ram='2', wifi_clients=1, podkop_status=status,
+                             podkop_test=None, podkop_proxy_tag=tag, timestamp=timestamp))
+
+        with patch.object(api, 'send_telegram_notification') as send:
+            report('server-a', 100)
+            report('server-b', 110)
+            send.assert_not_called()
+            self.assertTrue(db.toggle_notification_setting(1, 'podkop'))
+            report(None, 120, 'unknown')
+            report('older', 105)
+            report('server-b', 130)
+            send.assert_not_called()
+            report('server-c', 140)
+            report('server-c', 150)
+            send.assert_called_once_with(1, '🔀 Podkop сменил прокси на r\nserver-b → server-c')
+
+    def test_router_offline_and_recovery_alert_each_sent_once(self):
+        self.assertEqual(db.get_notification_settings(1), {'podkop': False, 'router': False})
+        self.assertTrue(db.toggle_notification_setting(1, 'router'))
+        with db.db_session() as conn:
+            conn.execute("UPDATE routers SET online=1,last_seen=0 WHERE router_id='r'")
+        with patch.object(api, 'send_telegram_notification') as send:
+            self.offline()
+            self.offline()
+            self.run_handler('post_devices', dict(router_id='r', devices=[]))
+            self.run_handler('post_devices', dict(router_id='r', devices=[]))
+            self.assertEqual([call.args for call in send.call_args_list], [
+                (1, '🔴 Роутер оффлайн: r'), (1, '🟢 Роутер онлайн: r'),
+            ])
+            self.assertFalse(db.toggle_notification_setting(1, 'router'))
+            with db.db_session() as conn:
+                conn.execute("UPDATE routers SET last_seen=0 WHERE router_id='r'")
+            self.offline()
+            with db.db_session() as conn:
+                self.assertEqual(conn.execute("SELECT online FROM routers WHERE router_id='r'").fetchone()[0], 0)
+            self.assertEqual(send.call_count, 2)
+
+    def test_telemetry_secret_is_bound_to_payload_router(self):
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO router_secrets(router_id,secret) VALUES ('r','secret')")
+        request = Request({'router_id': 'other'})
+        request.method = 'POST'
+        request.path = '/health'
+        request.headers = {'X-Agent-Secret': 'secret'}
+        result = asyncio.run(api.auth_middleware(request, api.post_health))
+        self.assertEqual(result.status, 403)
+        self.assertEqual(self.count('health_checks'), 0)
+
     def test_health_preserves_unknown_proxy_test(self):
         self.run_handler('post_health', dict(router_id='r', internet=True, wifi=True,
                          cpu='13.7%', ram='192MiB/485MiB', wifi_clients=6,

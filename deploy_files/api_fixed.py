@@ -102,16 +102,54 @@ def record_router_report(conn, router_id, notifications):
     return router
 
 
-def record_device_arrival(conn, router_id, chat_id, mac, previous):
-    if previous is None:
-        known = conn.execute("""
-            SELECT 1 FROM devices d JOIN routers r ON r.router_id=d.router_id
+def record_device_arrival(conn, router_id, chat_id, mac):
+    if chat_id is None:
+        return
+    presence = conn.execute("""
+        SELECT online FROM device_history_presence WHERE chat_id=? AND mac=?
+    """, (chat_id, mac)).fetchone()
+    if presence and presence["online"]:
+        return
+    if presence:
+        previous = presence["online"]
+    else:
+        previous = conn.execute("""
+            SELECT MAX(CASE WHEN d.online=1 THEN 1 ELSE 0 END)
+            FROM devices d JOIN routers r ON r.router_id=d.router_id
             WHERE d.mac=? COLLATE NOCASE AND r.chat_id=?
-            LIMIT 1
-        """, (mac, chat_id)).fetchone()
-        add_event(router_id, mac, "device_online" if known else "device_new", conn=conn)
-    elif not previous["online"]:
+        """, (mac, chat_id)).fetchone()[0]
+
+    conn.execute("""
+        INSERT INTO device_history_presence (chat_id, mac, online) VALUES (?, ?, 1)
+        ON CONFLICT(chat_id, mac) DO UPDATE SET online=1
+    """, (chat_id, mac))
+    if previous is None:
+        add_event(router_id, mac, "device_new", conn=conn)
+    elif not previous:
         add_event(router_id, mac, "device_online", conn=conn)
+
+
+def record_history_timeouts(conn, now, threshold):
+    # Let a new access point report the device before confirming a departure.
+    rows = conn.execute("""
+        SELECT p.chat_id, p.mac, (
+            SELECT d.router_id FROM devices d JOIN routers r ON r.router_id=d.router_id
+            WHERE r.chat_id=p.chat_id AND d.mac=p.mac COLLATE NOCASE
+            ORDER BY d.last_seen DESC, d.router_id LIMIT 1
+        ) AS router_id
+        FROM device_history_presence p
+        WHERE p.online=1 AND NOT EXISTS (
+            SELECT 1 FROM devices d JOIN routers r ON r.router_id=d.router_id
+            WHERE r.chat_id=p.chat_id AND d.mac=p.mac COLLATE NOCASE
+              AND (d.online=1 OR d.last_seen>=?)
+        )
+    """, (threshold,)).fetchall()
+    for row in rows:
+        conn.execute("""
+            UPDATE device_history_presence SET online=0 WHERE chat_id=? AND mac=?
+        """, (row["chat_id"], row["mac"]))
+        if row["router_id"] is not None:
+            add_event(row["router_id"], row["mac"], "device_offline", timestamp=now, conn=conn)
 
 # --- POST /event ---
 async def post_event(request):
@@ -144,7 +182,7 @@ async def post_event(request):
                                 (mac, data["router_id"])).fetchone()
             was_online = prev["online"] if prev else 0
             watch_online = prev["watch_online"] if prev else 1
-            record_device_arrival(conn, data["router_id"], chat_id, mac, prev)
+            record_device_arrival(conn, data["router_id"], chat_id, mac)
 
             conn.execute("""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
@@ -171,10 +209,8 @@ async def post_event(request):
             was_online = prev["online"] if prev else 0
             watch_online = prev["watch_online"] if prev else 1
 
-            conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
+            conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=? AND online=1",
                          (now, mac, data["router_id"]))
-            if was_online == 1:
-                add_event(data["router_id"], mac, "device_offline", conn=conn)
 
             # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
             if chat_id and was_online == 1 and watch_online == 1:
@@ -218,7 +254,7 @@ async def post_devices(request):
             # Check if device is new
             prev = conn.execute("SELECT online, watch_online, custom_name, hostname FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
             is_new = prev is None
-            record_device_arrival(conn, data["router_id"], chat_id, mac, prev)
+            record_device_arrival(conn, data["router_id"], chat_id, mac)
 
             conn.execute("""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
@@ -424,7 +460,6 @@ async def check_offline_devices(app):
 
                     # Mark as offline
                     conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
-                    add_event(router_id, mac, "device_offline", timestamp=now, conn=conn)
 
                     # Send notification if not recently notified
                     if (chat_id and dev["watch_online"] == 1
@@ -432,6 +467,8 @@ async def check_offline_devices(app):
                         mark_device_notified(chat_id, mac, router_id, conn=conn, notification_state=0)
                         device_name = dev["custom_name"] or dev["hostname"] or mac
                         notifications.append((chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}"))
+
+                record_history_timeouts(conn, now, threshold)
 
             for chat_id, text in notifications:
                 send_telegram_notification(chat_id, text)

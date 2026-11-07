@@ -136,11 +136,25 @@ def init_db():
             FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE,
             FOREIGN KEY (mac, router_id) REFERENCES devices(mac, router_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS device_history_presence (
+            chat_id INTEGER NOT NULL,
+            mac TEXT NOT NULL,
+            online INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, mac),
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
+        );
         """)
 
     # Миграция: добавить новые колонки если таблица уже существует
     with db_session() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            INSERT OR IGNORE INTO device_history_presence (chat_id, mac, online)
+            SELECT r.chat_id, lower(d.mac), MAX(CASE WHEN d.online=1 THEN 1 ELSE 0 END)
+            FROM devices d JOIN routers r ON r.router_id=d.router_id
+            GROUP BY r.chat_id, lower(d.mac)
+        """)
         settings_columns = {col["name"] for col in conn.execute("PRAGMA table_info(user_settings)")}
         if "watch_podkop_proxy" not in settings_columns:
             conn.execute("ALTER TABLE user_settings ADD COLUMN watch_podkop_proxy INTEGER NOT NULL DEFAULT 0")
@@ -234,6 +248,7 @@ def _remove_user_router_data(conn, chat_id):
         )
     """, (chat_id, chat_id))
     conn.execute("DELETE FROM routers WHERE chat_id=?", (chat_id,))
+    conn.execute("DELETE FROM device_history_presence WHERE chat_id=?", (chat_id,))
 
 
 def delete_user(chat_id):
@@ -587,6 +602,15 @@ def delete_router_complete(router_id):
     conn.execute("DELETE FROM events WHERE router_id=?", (router_id,))
     conn.execute("DELETE FROM devices WHERE router_id=?", (router_id,))
     conn.execute("DELETE FROM router_secrets WHERE router_id=?", (router_id,))
+    conn.execute("""
+        DELETE FROM device_history_presence
+        WHERE chat_id=(SELECT chat_id FROM routers WHERE router_id=?)
+          AND NOT EXISTS (
+              SELECT 1 FROM devices d JOIN routers r ON r.router_id=d.router_id
+              WHERE r.chat_id=device_history_presence.chat_id
+                AND d.mac=device_history_presence.mac COLLATE NOCASE
+          )
+    """, (router_id,))
     conn.commit()
     conn.close()
 

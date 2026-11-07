@@ -240,7 +240,7 @@ class Transactions(unittest.TestCase):
         self.assertEqual(rows[0]['known_hostname'], 'Phone')
         self.assertEqual(len(self.sent), 1)
 
-    def test_history_does_not_treat_known_mac_on_second_router_as_new(self):
+    def test_history_keeps_same_mac_separate_for_different_users(self):
         self.seed_device()
         with db.db_session() as conn:
             conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('second',1,1)")
@@ -248,9 +248,49 @@ class Transactions(unittest.TestCase):
             conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('other',2,1)")
         self.run_handler('post_devices', dict(router_id='second', devices=[{'mac': 'aa'}]))
         self.run_handler('post_devices', dict(router_id='other', devices=[{'mac': 'aa'}]))
-        self.assertEqual([(r['router_id'], r['event']) for r in db.get_user_events(1)],
-                         [('second', 'device_online')])
+        self.assertEqual(db.get_user_events(1), [])
         self.assertEqual([r['event'] for r in db.get_user_events(2)], ['device_new'])
+
+    def test_history_ignores_roaming_both_ways_and_records_real_departure(self):
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('second',1,1)")
+
+        def snapshot(router_id):
+            self.run_handler('post_devices', dict(router_id=router_id, devices=[{'mac': 'aa'}]))
+
+        def disconnect(router_id):
+            self.run_handler('post_event', dict(router_id=router_id, mac='aa', event='DISCONNECTED'))
+
+        snapshot('r')
+        snapshot('second')
+        disconnect('r')
+        self.offline()
+        disconnect('second')
+        self.offline()
+        snapshot('r')
+        self.offline()
+        self.assertEqual([row['event'] for row in db.get_user_events(1)], ['device_new'])
+
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.offline()
+        self.offline()
+        snapshot('second')
+        snapshot('second')
+        self.assertEqual([row['event'] for row in db.get_user_events(1)], [
+            'device_online', 'device_offline', 'device_new',
+        ])
+
+    def test_presence_migration_uses_existing_online_status_without_history(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute("DROP TABLE device_history_presence")
+        db.init_db()
+        db.init_db()
+        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
+        with db.db_session() as conn:
+            self.assertEqual(conn.execute("SELECT online FROM device_history_presence WHERE chat_id=1 AND mac='aa'").fetchone()[0], 1)
+        self.assertEqual(db.get_user_events(1), [])
 
     def test_bulk_disable_only_changes_owned_devices_and_keeps_discovery(self):
         self.seed_device(online=0)

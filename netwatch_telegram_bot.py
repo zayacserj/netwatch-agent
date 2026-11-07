@@ -591,19 +591,46 @@ async def cmd_guide(message: Message):
 
 
 # --- /history ---
+def format_history_event(event):
+    kind = event["event"].upper()
+    labels = {
+        "DEVICE_NEW": "🆕 Новое устройство",
+        "DEVICE_ONLINE": "🟢 Устройство онлайн",
+        "DEVICE_OFFLINE": "🔴 Устройство оффлайн",
+        "CONNECTED": "🟢 Устройство онлайн",
+        "DISCONNECTED": "🔴 Устройство оффлайн",
+        "AP-STA-CONNECTED": "🟢 Устройство онлайн",
+        "AP-STA-DISCONNECTED": "🔴 Устройство оффлайн",
+        "ROUTER_ONLINE": "🟢 Роутер онлайн",
+        "ROUTER_OFFLINE": "🔴 Роутер оффлайн",
+    }
+    time = fmt_time(event["timestamp"])
+    router = " ".join((event["router_name"] or event["router_id"]).split())[:64]
+    label = labels[kind]
+    if kind.startswith("ROUTER_"):
+        return f"{time} · {label} · {router}"
+    mac = (event["mac"] or "н/д")[:32]
+    name = event["custom_name"] or event["known_hostname"] or mac
+    name = " ".join(name.split())[:64] or mac
+    device = name if name == mac else f"{name} ({mac})"
+    return f"{time} · {label} · {device} · {router}"
+
+
 @dp.message(Command("history"))
 async def cmd_history(message: Message):
     upsert_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-    events = get_user_events(message.from_user.id, hours=24)
+    events = get_user_events(message.from_user.id, hours=24, limit=50)
     if not events:
         await message.reply("📭 Нет событий за последние 24 часа.")
         return
-    lines = ["📜 *История событий (24ч):*"]
-    for e in events[:50]:
-        t = fmt_time(e["timestamp"])
-        evt = "🟢 подключился" if "CONNECTED" in e["event"].upper() else "🔴 отключился"
-        lines.append(f"{t} — {e.get('router_name', e['router_id'])}: {e['mac']} {evt}")
-    await message.reply("\n".join(lines), )
+    page = "📜 История за 24 часа"
+    for event in events:
+        line = format_history_event(event)
+        if len((page + "\n" + line).encode("utf-16-le")) // 2 > 4000:
+            await message.reply(page)
+            page = "📜 История за 24 часа · продолжение"
+        page += "\n" + line
+    await message.reply(page)
 
 
 # --- /health ---

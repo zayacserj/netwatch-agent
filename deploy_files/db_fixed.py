@@ -469,25 +469,29 @@ def upsert_device_with_notification(chat_id, mac, router_id, data):
 
 # --- events ---
 
-def add_event(router_id, mac, event, timestamp=None):
-    conn = get_conn()
-    ts = timestamp or int(time.time())
-    conn.execute("INSERT INTO events (router_id, mac, event, timestamp) VALUES (?, ?, ?, ?)",
-                 (router_id, mac.lower(), event, ts))
-    conn.commit()
-    conn.close()
+def add_event(router_id, mac, event, timestamp=None, conn=None):
+    with db_session(conn) as conn:
+        ts = timestamp if timestamp is not None else int(time.time())
+        conn.execute("INSERT INTO events (router_id, mac, event, timestamp) VALUES (?, ?, ?, ?)",
+                     (router_id, mac.lower() if mac is not None else None, event, ts))
 
 
-def get_user_events(chat_id, hours=24):
+def get_user_events(chat_id, hours=24, limit=-1):
     conn = get_conn()
     since_ts = int(time.time()) - hours * 3600
-    rows = conn.execute("""
-        SELECT e.*, r.name AS router_name
+    rows = conn.execute(f"""
+        SELECT e.*, r.name AS router_name, d.custom_name, {_DEVICE_HOSTNAME_SQL}
         FROM events e
         JOIN routers r ON e.router_id = r.router_id
+        LEFT JOIN devices d ON d.mac=e.mac COLLATE NOCASE AND d.router_id=e.router_id
         WHERE r.chat_id=? AND e.timestamp >= ?
-        ORDER BY e.timestamp DESC
-    """, (chat_id, since_ts)).fetchall()
+          AND upper(e.event) IN (
+              'DEVICE_NEW', 'DEVICE_ONLINE', 'DEVICE_OFFLINE', 'ROUTER_ONLINE', 'ROUTER_OFFLINE',
+              'CONNECTED', 'DISCONNECTED', 'AP-STA-CONNECTED', 'AP-STA-DISCONNECTED'
+          )
+        ORDER BY e.timestamp DESC, e.id DESC
+        LIMIT ?
+    """, (chat_id, since_ts, limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

@@ -29,7 +29,7 @@ from aiohttp import web
 
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router,
-    can_notify_device, mark_device_notified, init_db, db_session
+    add_event, can_notify_device, mark_device_notified, init_db, db_session
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
@@ -95,9 +95,23 @@ def record_router_report(conn, router_id, notifications):
     """, (router_id,)).fetchone()
     if router is not None:
         conn.execute("UPDATE routers SET last_seen=unixepoch(), online=1 WHERE router_id=?", (router_id,))
-        if not router["online"] and router["watch_router_online"]:
-            notifications.append((router["chat_id"], f"🟢 Роутер онлайн: {router['name'] or router_id}"))
+        if not router["online"]:
+            add_event(router_id, None, "router_online", conn=conn)
+            if router["watch_router_online"]:
+                notifications.append((router["chat_id"], f"🟢 Роутер онлайн: {router['name'] or router_id}"))
     return router
+
+
+def record_device_arrival(conn, router_id, chat_id, mac, previous):
+    if previous is None:
+        known = conn.execute("""
+            SELECT 1 FROM devices d JOIN routers r ON r.router_id=d.router_id
+            WHERE d.mac=? COLLATE NOCASE AND r.chat_id=?
+            LIMIT 1
+        """, (mac, chat_id)).fetchone()
+        add_event(router_id, mac, "device_online" if known else "device_new", conn=conn)
+    elif not previous["online"]:
+        add_event(router_id, mac, "device_online", conn=conn)
 
 # --- POST /event ---
 async def post_event(request):
@@ -112,12 +126,9 @@ async def post_event(request):
 
     notifications = []
     with db_session() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         mac = data["mac"].lower()
         event = data["event"]
-        timestamp = data.get("timestamp", int(time.time()))
-
-        conn.execute("INSERT INTO events (router_id, mac, event, timestamp) VALUES (?, ?, ?, ?)",
-                     (data["router_id"], mac, event, timestamp))
 
         # Получаем chat_id пользователя этого роутера
         router = record_router_report(conn, data["router_id"], notifications)
@@ -133,6 +144,7 @@ async def post_event(request):
                                 (mac, data["router_id"])).fetchone()
             was_online = prev["online"] if prev else 0
             watch_online = prev["watch_online"] if prev else 1
+            record_device_arrival(conn, data["router_id"], chat_id, mac, prev)
 
             conn.execute("""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
@@ -161,6 +173,8 @@ async def post_event(request):
 
             conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=?",
                          (now, mac, data["router_id"]))
+            if was_online == 1:
+                add_event(data["router_id"], mac, "device_offline", conn=conn)
 
             # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
             if chat_id and was_online == 1 and watch_online == 1:
@@ -204,6 +218,7 @@ async def post_devices(request):
             # Check if device is new
             prev = conn.execute("SELECT online, watch_online, custom_name, hostname FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
             is_new = prev is None
+            record_device_arrival(conn, data["router_id"], chat_id, mac, prev)
 
             conn.execute("""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
@@ -386,6 +401,7 @@ async def check_offline_devices(app):
                     RETURNING router_id, name, chat_id
                 """, (now - ROUTER_OFFLINE_AFTER,)).fetchall()
                 for router in stale_routers:
+                    add_event(router["router_id"], None, "router_offline", timestamp=now, conn=conn)
                     setting = conn.execute("""
                         SELECT watch_router_online FROM user_settings WHERE chat_id=?
                     """, (router["chat_id"],)).fetchone()
@@ -408,6 +424,7 @@ async def check_offline_devices(app):
 
                     # Mark as offline
                     conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
+                    add_event(router_id, mac, "device_offline", timestamp=now, conn=conn)
 
                     # Send notification if not recently notified
                     if (chat_id and dev["watch_online"] == 1

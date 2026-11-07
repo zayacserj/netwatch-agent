@@ -63,7 +63,7 @@ class Transactions(unittest.TestCase):
         db.init_db()
         with db.db_session() as conn:
             conn.execute('INSERT INTO users(chat_id) VALUES (1)')
-            conn.execute("INSERT INTO routers(router_id,chat_id) VALUES ('r',1)")
+            conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('r',1,1)")
         self.connections = []
         self.fail_commit = False
 
@@ -141,7 +141,7 @@ class Transactions(unittest.TestCase):
     def test_disconnect_unknown_device_does_not_create_online_device(self):
         self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
         self.assertIsNone(self.online())
-        self.assertEqual(self.count('events'), 1)
+        self.assertEqual(self.count('events'), 0)
         self.assertEqual(self.sent, [])
 
     def test_disconnect_respects_recent_notification(self):
@@ -222,6 +222,36 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.count('health_checks'), 1)
         self.assertTrue(all(c.closed for c in self.connections))
 
+    def test_history_records_snapshot_transitions_even_with_notifications_muted(self):
+        report = dict(router_id='r', devices=[{'mac': 'aa', 'hostname': 'Phone'}])
+        self.run_handler('post_devices', report)
+        self.run_handler('post_devices', report)
+        self.assertEqual(db.disable_device_notifications(1), 1)
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.offline()
+        self.offline()
+        self.run_handler('post_devices', report)
+        self.run_handler('post_devices', report)
+        rows = db.get_user_events(1)
+        self.assertEqual([row['event'] for row in rows], [
+            'device_online', 'device_offline', 'device_new',
+        ])
+        self.assertEqual(rows[0]['known_hostname'], 'Phone')
+        self.assertEqual(len(self.sent), 1)
+
+    def test_history_does_not_treat_known_mac_on_second_router_as_new(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('second',1,1)")
+            conn.execute("INSERT INTO users(chat_id) VALUES (2)")
+            conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('other',2,1)")
+        self.run_handler('post_devices', dict(router_id='second', devices=[{'mac': 'aa'}]))
+        self.run_handler('post_devices', dict(router_id='other', devices=[{'mac': 'aa'}]))
+        self.assertEqual([(r['router_id'], r['event']) for r in db.get_user_events(1)],
+                         [('second', 'device_online')])
+        self.assertEqual([r['event'] for r in db.get_user_events(2)], ['device_new'])
+
     def test_bulk_disable_only_changes_owned_devices_and_keeps_discovery(self):
         self.seed_device(online=0)
         with db.db_session() as conn:
@@ -292,6 +322,9 @@ class Transactions(unittest.TestCase):
             with db.db_session() as conn:
                 self.assertEqual(conn.execute("SELECT online FROM routers WHERE router_id='r'").fetchone()[0], 0)
             self.assertEqual(send.call_count, 2)
+        self.assertEqual([(row['event'], row['mac']) for row in db.get_user_events(1)], [
+            ('router_offline', None), ('router_online', None), ('router_offline', None),
+        ])
 
     def test_telemetry_secret_is_bound_to_payload_router(self):
         with db.db_session() as conn:

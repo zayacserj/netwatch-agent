@@ -31,6 +31,13 @@ curl --fail --silent --show-error http://127.0.0.1:8090/monitor/api/v1/metrics
 
 После локальной проверки файлы размещаются в `/opt/netwatch/monitor`,
 а unit-файл — в `/etc/systemd/system/netwatch-monitor.service`.
+Перед первым запуском создайте отдельную системную учётную запись для
+монитора. Она позволяет читать статусы служб через системную шину:
+
+```bash
+useradd --system --user-group --no-create-home --shell /usr/sbin/nologin netwatch-metrics
+```
+
 Сначала проверьте службу локально и измерьте CPU и память. Затем добавьте
 маршрут из `Caddyfile.example` внутрь HTTPS-блока NetWatch. Проверяйте и
 страницу, и `/monitor/api/v1/metrics`: без логина оба должны возвращать 401.

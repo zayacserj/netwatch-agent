@@ -4,7 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-DynamicUser=yes
+User=netwatch-metrics
+Group=netwatch-metrics
 WorkingDirectory=/opt/netwatch/monitor
 ExecStart=/usr/bin/python3 -B /opt/netwatch/monitor/pi_monitor.py
 Restart=on-failure

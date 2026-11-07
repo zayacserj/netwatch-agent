@@ -92,8 +92,27 @@ netwatch_restore_files() {
 }
 
 # --- pair ---
+netwatch_install_dependencies() {
+    local packages='' tool
+    for tool in curl jq iw iwinfo; do
+        command -v "$tool" >/dev/null 2>&1 || packages="$packages $tool"
+    done
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-bundle"
+    [ -n "$packages" ] || return 0
+
+    log "Installing OpenWrt packages:$packages"
+    if command -v apk >/dev/null 2>&1; then
+        apk update && apk add $packages
+    elif command -v opkg >/dev/null 2>&1; then
+        opkg update && opkg install $packages
+    else
+        log "No supported OpenWrt package manager found"
+        return 1
+    fi
+}
+
 cmd_pair() {
-    local code='' url='' re_pair=0 tool work router_id mac model http secret authority
+    local code='' url='' re_pair=0 install_deps=0 tool work router_id mac model http secret authority
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --code|--url)
@@ -101,10 +120,15 @@ cmd_pair() {
                 if [ "$1" = --code ]; then code="$2"; else url="$2"; fi
                 shift 2 ;;
             --re-pair) re_pair=1; shift ;;
+            --install-deps) install_deps=1; shift ;;
             *) log "Unknown pairing flag"; return 1 ;;
         esac
     done
     [ "$(id -u)" = 0 ] || { log "Run installation as root"; return 1; }
+    if [ "$install_deps" = 1 ]; then
+        [ -r /etc/openwrt_release ] || { log "Dependency installation requires OpenWrt"; return 1; }
+        netwatch_install_dependencies || return 1
+    fi
     for tool in curl jq iw iwinfo crontab logger sha256sum awk cmp; do
         command -v "$tool" >/dev/null 2>&1 || { log "Missing dependency: $tool (install it before pairing)"; return 1; }
     done

@@ -329,6 +329,7 @@ class Transactions(unittest.TestCase):
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_sample_at")
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_latency_ms")
             conn.execute("ALTER TABLE routers DROP COLUMN device_snapshot_at")
+            conn.execute("ALTER TABLE routers DROP COLUMN device_fast_snapshot_at")
             conn.execute("INSERT INTO user_settings(chat_id, watch_online) VALUES (1, 0)")
         db.init_db()
         db.init_db()
@@ -726,10 +727,12 @@ class Transactions(unittest.TestCase):
             conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('legacy',2,1)")
             conn.execute("INSERT INTO devices(mac,router_id,online,last_seen) VALUES ('aa','legacy',1,1000)")
             conn.execute("INSERT INTO device_history_presence VALUES (2, 'aa', 1)")
-        with patch.object(api, 'FAST_DEVICE_CHAT_IDS', (1,)), patch.object(api.time, 'time') as clock:
+        with patch.object(api.time, 'time') as clock:
             clock.return_value = 1020
-            self.run_handler('post_devices', dict(router_id='r', devices=[]))
+            self.run_handler('post_devices', dict(router_id='r', devices=[], snapshot_interval=20))
             self.run_handler('post_devices', dict(router_id='legacy', devices=[]))
+            clock.return_value = 1040
+            self.run_handler('post_devices', dict(router_id='r', devices=[], snapshot_interval=20))
             clock.return_value = 1055
             self.offline()
             self.assertEqual(db.get_device(1, 'aa', 'r')['online'], 1)
@@ -737,6 +740,26 @@ class Transactions(unittest.TestCase):
             self.offline()
             self.assertEqual(db.get_device(1, 'aa', 'r')['online'], 0)
             self.assertEqual(db.get_device(2, 'aa', 'legacy')['online'], 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_slow_point_in_same_account_blocks_fast_offline_until_upgraded(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=1000 WHERE mac='aa'")
+            conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('second',1,1)")
+        with patch.object(api.time, 'time') as clock:
+            for now in (1020, 1040):
+                clock.return_value = now
+                self.run_handler('post_devices', dict(router_id='r', devices=[], snapshot_interval=20))
+                self.run_handler('post_devices', dict(router_id='second', devices=[]))
+            clock.return_value = 1056
+            self.offline()
+            self.assertEqual(self.online(), 1)
+            clock.return_value = 1060
+            self.run_handler('post_devices', dict(router_id='r', devices=[], snapshot_interval=20))
+            self.run_handler('post_devices', dict(router_id='second', devices=[], snapshot_interval=20))
+            self.offline()
+            self.assertEqual(self.online(), 0)
         self.assertEqual(len(self.sent), 1)
 
     def test_notification_migration_preserves_legacy_data_and_is_repeatable(self):

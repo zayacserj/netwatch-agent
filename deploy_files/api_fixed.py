@@ -39,10 +39,6 @@ AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
 ROUTER_OFFLINE_AFTER = 7 * 60
 DEVICE_OFFLINE_AFTER = 120
 FAST_DEVICE_OFFLINE_AFTER = 55
-FAST_DEVICE_CHAT_IDS = tuple(
-    int(value) for value in os.getenv("NETWATCH_FAST_DEVICE_CHAT_IDS", "").split(",")
-    if value.strip()
-)
 OFFLINE_CHECK_INTERVAL = 10
 KEEP_KNOWN_HOSTNAME = """
     CASE WHEN lower(trim(excluded.hostname)) NOT IN ('', '*', 'unknown')
@@ -164,12 +160,17 @@ def record_device_arrival(conn, router_id, chat_id, mac):
 
 
 def device_offline_cutoff(owner, now):
-    if not FAST_DEVICE_CHAT_IDS:
-        return "?", (now - DEVICE_OFFLINE_AFTER,)
-    placeholders = ", ".join("?" for _ in FAST_DEVICE_CHAT_IDS)
     return (
-        f"CASE WHEN {owner}.chat_id IN ({placeholders}) THEN ? ELSE ? END",
-        (*FAST_DEVICE_CHAT_IDS, now - FAST_DEVICE_OFFLINE_AFTER, now - DEVICE_OFFLINE_AFTER),
+        f"""CASE WHEN EXISTS (
+                SELECT 1 FROM routers fast
+                WHERE fast.chat_id={owner}.chat_id AND fast.device_fast_snapshot_at>=?
+            ) AND NOT EXISTS (
+                SELECT 1 FROM routers other
+                WHERE other.chat_id={owner}.chat_id AND other.last_seen>=?
+                  AND COALESCE(other.device_fast_snapshot_at, 0)<?
+            ) THEN ? ELSE ? END""",
+        (now - 35, now - ROUTER_OFFLINE_AFTER, now - 35,
+         now - FAST_DEVICE_OFFLINE_AFTER, now - DEVICE_OFFLINE_AFTER),
     )
 
 
@@ -297,7 +298,14 @@ async def post_devices(request):
 
         # Only a complete Wi-Fi snapshot can confirm that an unlisted device left.
         if router is not None and saved == len(data["devices"]):
-            conn.execute("UPDATE routers SET device_snapshot_at=? WHERE router_id=?", (now, data["router_id"]))
+            conn.execute("""
+                UPDATE routers
+                SET device_fast_snapshot_at=CASE
+                        WHEN ?=1 AND ? - device_snapshot_at BETWEEN 12 AND 30 THEN ?
+                    END,
+                    device_snapshot_at=?
+                WHERE router_id=?
+            """, (int(data.get("snapshot_interval") == 20), now, now, now, data["router_id"]))
 
     for chat_id, text in notifications:
         send_telegram_notification(chat_id, text)

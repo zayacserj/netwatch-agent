@@ -62,6 +62,7 @@ def init_db():
             online INTEGER DEFAULT 0,
             last_seen INTEGER DEFAULT (unixepoch()),
             device_snapshot_at INTEGER,
+            device_fast_snapshot_at INTEGER,
             podkop_proxy_tag TEXT,
             podkop_proxy_sample_at INTEGER,
             podkop_proxy_latency_ms INTEGER,
@@ -165,6 +166,8 @@ def init_db():
         router_columns = {col["name"] for col in conn.execute("PRAGMA table_info(routers)")}
         if "device_snapshot_at" not in router_columns:
             conn.execute("ALTER TABLE routers ADD COLUMN device_snapshot_at INTEGER")
+        if "device_fast_snapshot_at" not in router_columns:
+            conn.execute("ALTER TABLE routers ADD COLUMN device_fast_snapshot_at INTEGER")
         if "podkop_proxy_tag" not in router_columns:
             conn.execute("ALTER TABLE routers ADD COLUMN podkop_proxy_tag TEXT")
         if "podkop_proxy_sample_at" not in router_columns:

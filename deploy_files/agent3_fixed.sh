@@ -65,8 +65,21 @@ netwatch_cron_prepare() {
             if (!owned) print
         }
     ' "$1/cron.before" > "$1/cron.new" || return 1
-    printf '* * * * * %s snapshot 2>&1 | logger -t netwatch-agent\n*/5 * * * * %s run 2>&1 | logger -t netwatch-agent\n' \
-        "$AGENT_FILE" "$AGENT_FILE" >> "$1/cron.new" || return 1
+    local flock_path delay prefix
+    flock_path=$(command -v flock) || flock_path=
+    if [ -n "$flock_path" ]; then
+        for delay in 0 20 40; do
+            prefix=''
+            [ "$delay" = 0 ] || prefix="sleep $delay && "
+            printf '* * * * * %sNETWATCH_SNAPSHOT_INTERVAL=20 %s -n /var/run/netwatch-snapshot.lock %s snapshot 2>&1 | logger -t netwatch-agent\n' \
+                "$prefix" "$flock_path" "$AGENT_FILE" >> "$1/cron.new" || return 1
+        done
+    else
+        printf '* * * * * %s snapshot 2>&1 | logger -t netwatch-agent\n' \
+            "$AGENT_FILE" >> "$1/cron.new" || return 1
+    fi
+    printf '*/5 * * * * %s run 2>&1 | logger -t netwatch-agent\n' \
+        "$AGENT_FILE" >> "$1/cron.new" || return 1
 }
 
 netwatch_cron_apply() {
@@ -92,22 +105,30 @@ netwatch_restore_files() {
 }
 
 # --- pair ---
-netwatch_install_dependencies() {
-    local packages='' tool
-    for tool in curl jq iw iwinfo; do
-        command -v "$tool" >/dev/null 2>&1 || packages="$packages $tool"
-    done
-    [ -s /etc/ssl/certs/ca-certificates.crt ] || packages="$packages ca-bundle"
-    [ -n "$packages" ] || return 0
-
-    log "Installing OpenWrt packages:$packages"
+netwatch_install_packages() {
+    log "Installing OpenWrt packages: $*"
     if command -v apk >/dev/null 2>&1; then
-        apk update && apk add $packages
+        apk update && apk add "$@"
     elif command -v opkg >/dev/null 2>&1; then
-        opkg update && opkg install $packages
+        opkg update && opkg install "$@"
     else
         log "No supported OpenWrt package manager found"
         return 1
+    fi
+}
+
+netwatch_install_dependencies() {
+    local tool
+    set --
+    for tool in curl jq iw iwinfo; do
+        command -v "$tool" >/dev/null 2>&1 || set -- "$@" "$tool"
+    done
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || set -- "$@" ca-bundle
+    if [ "$#" -gt 0 ]; then
+        netwatch_install_packages "$@" || return 1
+    fi
+    if ! command -v flock >/dev/null 2>&1; then
+        netwatch_install_packages flock || log "flock unavailable, snapshots will run once a minute"
     fi
 }
 
@@ -273,7 +294,11 @@ cmd_pair() {
         return 1
     fi
     rm -f /etc/netwatch/pairing.pending_id "$work/payload.json" "$work/response.json"
-    log "Installed: snapshot every minute, health every 5 minutes; logs: logread -e netwatch-agent"
+    if command -v flock >/dev/null 2>&1; then
+        log "Installed: snapshot every 20 seconds, health every 5 minutes; logs: logread -e netwatch-agent"
+    else
+        log "Installed: snapshot every minute (flock unavailable), health every 5 minutes; logs: logread -e netwatch-agent"
+    fi
     if sh "$AGENT_FILE" run; then
         log "Initial data delivery completed"
     else
@@ -331,9 +356,11 @@ cmd_snapshot() {
         done
     done
 
-    payload=$(jq -cn --arg router_id "$router_id" \
+    local snapshot_interval=60
+    [ "${NETWATCH_SNAPSHOT_INTERVAL:-}" != 20 ] || snapshot_interval=20
+    payload=$(jq -cn --arg router_id "$router_id" --argjson interval "$snapshot_interval" \
         --argjson devices "$devices_json" --argjson timestamp "$(date +%s)" \
-        '{router_id:$router_id, devices:$devices, timestamp:$timestamp}') || return 1
+        '{router_id:$router_id, devices:$devices, timestamp:$timestamp, snapshot_interval:$interval}') || return 1
 
     # Keep the secret out of process arguments; report HTTP/transport failures.
     printf 'X-Agent-Secret: %s\n' "$AGENT_SECRET" |

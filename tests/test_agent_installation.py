@@ -83,6 +83,7 @@ sys.exit(int(os.environ.get('CURL_EXIT','0')))
         self.prefix = '''id() { echo 0; }
 iw() { :; }
 iwinfo() { :; }
+flock() { :; }
 logger() { :; }
 crontab() {
     [ "${CRON_FAIL:-0}" = 0 ] || return 1
@@ -124,7 +125,10 @@ curl() { ''' + shlex.quote(Path(sys.executable).as_posix()) + ' ' + shlex.quote(
     def assert_cron(self):
         text = self.cron.read_text()
         self.assertTrue(text.startswith(self.original_cron))
-        self.assertEqual(text.count(str(self.installed.as_posix()) + ' snapshot'), 1)
+        self.assertEqual(text.count(str(self.installed.as_posix()) + ' snapshot'), 3)
+        self.assertEqual(text.count('NETWATCH_SNAPSHOT_INTERVAL=20'), 3)
+        self.assertIn('sleep 20 &&', text)
+        self.assertIn('sleep 40 &&', text)
         self.assertEqual(text.count(str(self.installed.as_posix()) + ' run'), 1)
         self.assertNotIn('/mnt/usb', text)
         self.assertIn('logger -t netwatch-agent', text)

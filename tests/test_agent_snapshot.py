@@ -88,6 +88,12 @@ curl() {
         result = self.run_snapshot()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.payload()['devices'], [])
+        self.assertEqual(self.payload()['snapshot_interval'], 60)
+
+    def test_fast_cron_marks_its_snapshot_interval(self):
+        result = self.run_snapshot(NETWATCH_SNAPSHOT_INTERVAL='20')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.payload()['snapshot_interval'], 20)
 
     def test_dedup_and_json_escaping(self):
         hostname = 'device"with\\quotes'

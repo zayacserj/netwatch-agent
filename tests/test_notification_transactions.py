@@ -234,6 +234,7 @@ class Transactions(unittest.TestCase):
         self.assertEqual(db.disable_device_notifications(1), 1)
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.run_handler('post_devices', dict(router_id='r', devices=[]))
         self.offline()
         self.offline()
         self.run_handler('post_devices', report)
@@ -279,6 +280,8 @@ class Transactions(unittest.TestCase):
 
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        for router_id in ('r', 'second'):
+            self.run_handler('post_devices', dict(router_id=router_id, devices=[]))
         self.offline()
         self.offline()
         snapshot('second')
@@ -325,6 +328,7 @@ class Transactions(unittest.TestCase):
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_tag")
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_sample_at")
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_latency_ms")
+            conn.execute("ALTER TABLE routers DROP COLUMN device_snapshot_at")
             conn.execute("INSERT INTO user_settings(chat_id, watch_online) VALUES (1, 0)")
         db.init_db()
         db.init_db()
@@ -676,6 +680,7 @@ class Transactions(unittest.TestCase):
         self.seed_device(watch=0)
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.run_handler('post_devices', dict(router_id='r', devices=[]))
         self.offline()
         self.assertEqual(self.online(), 0)
         self.assertEqual(self.sent, [])
@@ -685,6 +690,7 @@ class Transactions(unittest.TestCase):
         self.seed_device()
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.run_handler('post_devices', dict(router_id='r', devices=[]))
         self.offline()
         self.assertEqual(self.online(), 0)
         self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
@@ -692,6 +698,40 @@ class Transactions(unittest.TestCase):
         self.assertEqual(len(self.sent), 2)
         self.assertTrue(self.sent[0][1].startswith('🔴'))
         self.assertTrue(self.sent[1][1].startswith('🟢'))
+
+    def test_missing_snapshots_do_not_send_device_offline_alerts(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+            conn.execute("UPDATE routers SET device_snapshot_at=1 WHERE router_id='r'")
+        self.offline()
+        self.assertEqual(self.online(), 1)
+        self.assertEqual(self.sent, [])
+
+        self.run_handler('post_devices', dict(router_id='r', devices=[{}]))
+        self.offline()
+        self.assertEqual(self.online(), 1)
+        self.assertEqual(self.sent, [])
+
+        self.run_handler('post_devices', dict(router_id='r', devices=[]))
+        self.offline()
+        self.assertEqual(self.online(), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_fast_offline_waits_for_grace_and_confirming_snapshot(self):
+        self.seed_device()
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=1000 WHERE mac='aa'")
+        with patch.object(api, 'DEVICE_OFFLINE_AFTER', 55), patch.object(api.time, 'time') as clock:
+            clock.return_value = 1020
+            self.run_handler('post_devices', dict(router_id='r', devices=[]))
+            clock.return_value = 1055
+            self.offline()
+            self.assertEqual(self.online(), 1)
+            clock.return_value = 1060
+            self.offline()
+            self.assertEqual(self.online(), 0)
+        self.assertEqual(len(self.sent), 1)
 
     def test_notification_migration_preserves_legacy_data_and_is_repeatable(self):
         self.seed_device()
@@ -723,12 +763,15 @@ class Transactions(unittest.TestCase):
         self.seed_device()
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.run_handler('post_devices', dict(router_id='r', devices=[]))
         self.offline()
         self.assertEqual(len(self.sent), 1)
 
     def test_offline_commit_failure(self):
+        self.seed_device()
         with db.db_session() as conn:
-            conn.execute("INSERT INTO devices(mac,router_id,online,last_seen) VALUES ('aa','r',1,0)")
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.run_handler('post_devices', dict(router_id='r', devices=[]))
         original_commit = TrackedConnection.commit
         calls = []
 

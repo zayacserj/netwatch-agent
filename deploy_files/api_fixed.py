@@ -37,6 +37,8 @@ DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
 ROUTER_OFFLINE_AFTER = 7 * 60
+DEVICE_OFFLINE_AFTER = 55 if os.getenv("NETWATCH_FAST_DEVICE_SNAPSHOTS") == "1" else 120
+OFFLINE_CHECK_INTERVAL = 10
 KEEP_KNOWN_HOSTNAME = """
     CASE WHEN lower(trim(excluded.hostname)) NOT IN ('', '*', 'unknown')
          THEN excluded.hostname ELSE devices.hostname END
@@ -237,7 +239,7 @@ async def post_devices(request):
     except json.JSONDecodeError:
         return web.json_response({"error": "Bad JSON"}, status=400)
 
-    if "router_id" not in data or "devices" not in data:
+    if not isinstance(data, dict) or "router_id" not in data or not isinstance(data.get("devices"), list):
         return web.json_response({"error": "Missing router_id or devices"}, status=400)
 
     notifications = []
@@ -276,6 +278,10 @@ async def post_devices(request):
                 new_devices.append(mac)
             if arrival:
                 queue_presence_notification(conn, notifications, chat_id, mac, data["router_id"], arrival)
+
+        # Only a complete Wi-Fi snapshot can confirm that an unlisted device left.
+        if router is not None and saved == len(data["devices"]):
+            conn.execute("UPDATE routers SET device_snapshot_at=? WHERE router_id=?", (now, data["router_id"]))
 
     for chat_id, text in notifications:
         send_telegram_notification(chat_id, text)
@@ -442,7 +448,7 @@ async def check_offline_devices(app):
             with db_session() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 now = int(time.time())
-                threshold = now - 120  # 2 minutes
+                threshold = now - DEVICE_OFFLINE_AFTER
                 stale_routers = conn.execute("""
                     UPDATE routers SET online=0
                     WHERE online=1 AND last_seen < ?
@@ -457,7 +463,15 @@ async def check_offline_devices(app):
                         name = router["name"] or router["router_id"]
                         notifications.append((router["chat_id"], f"🔴 Роутер оффлайн: {name}"))
 
-                conn.execute("UPDATE devices SET online=0 WHERE online=1 AND last_seen < ?", (threshold,))
+                conn.execute("""
+                    UPDATE devices SET online=0
+                    WHERE online=1 AND last_seen < ? AND EXISTS (
+                        SELECT 1 FROM routers r
+                        WHERE r.router_id=devices.router_id
+                          AND r.device_snapshot_at > devices.last_seen
+                          AND r.device_snapshot_at >= ?
+                    )
+                """, (threshold, now - 75))
                 record_history_timeouts(conn, notifications, now, threshold)
 
             for chat_id, text in notifications:
@@ -466,7 +480,7 @@ async def check_offline_devices(app):
             import logging
             logging.getLogger(__name__).error(f"Offline check error: {e}")
 
-        await asyncio.sleep(60)  # Check every minute
+        await asyncio.sleep(OFFLINE_CHECK_INTERVAL)
 
 
 async def start_offline_check(app):

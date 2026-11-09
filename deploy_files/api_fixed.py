@@ -29,7 +29,7 @@ from aiohttp import web
 
 from db import (
     get_pairing_code, consume_pairing_code, upsert_router,
-    add_event, can_notify_device, mark_device_notified, init_db, db_session, get_device
+    add_event, mark_device_notified, init_db, db_session, get_device
 )
 
 DB_PATH = Path("/opt/netwatch/netwatch.db")
@@ -42,9 +42,18 @@ KEEP_KNOWN_HOSTNAME = """
 """
 
 
-def notification_device_name(conn, chat_id, mac, router_id):
+def queue_presence_notification(conn, notifications, chat_id, mac, router_id, event):
     device = get_device(chat_id, mac, router_id, conn=conn)
-    return (device["custom_name"] or device["known_hostname"] or mac) if device else mac
+    if not device or (event != "device_new" and device["watch_online"] != 1):
+        return
+    labels = {
+        "device_new": "🆕 Новое устройство",
+        "device_online": "🟢 Устройство онлайн",
+        "device_offline": "🔴 Устройство оффлайн (таймаут)",
+    }
+    name = device["custom_name"] or device["known_hostname"] or mac
+    mark_device_notified(chat_id, mac, router_id, conn=conn, notification_state=int(event != "device_offline"))
+    notifications.append((chat_id, f"{labels[event]}: `{mac}` — {name}"))
 
 # --- Telegram notification helper ---
 def send_telegram_notification(chat_id, text):
@@ -133,12 +142,16 @@ def record_device_arrival(conn, router_id, chat_id, mac):
         ON CONFLICT(chat_id, mac) DO UPDATE SET online=1
     """, (chat_id, mac))
     if previous is None:
-        add_event(router_id, mac, "device_new", conn=conn)
+        event = "device_new"
     elif not previous:
-        add_event(router_id, mac, "device_online", conn=conn)
+        event = "device_online"
+    else:
+        return
+    add_event(router_id, mac, event, conn=conn)
+    return event
 
 
-def record_history_timeouts(conn, now, threshold):
+def record_history_timeouts(conn, notifications, now, threshold):
     # Let a new access point report the device before confirming a departure.
     rows = conn.execute("""
         SELECT p.chat_id, p.mac, (
@@ -159,6 +172,9 @@ def record_history_timeouts(conn, now, threshold):
         """, (row["chat_id"], row["mac"]))
         if row["router_id"] is not None:
             add_event(row["router_id"], row["mac"], "device_offline", timestamp=now, conn=conn)
+            queue_presence_notification(
+                conn, notifications, row["chat_id"], row["mac"], row["router_id"], "device_offline",
+            )
 
 # --- POST /event ---
 async def post_event(request):
@@ -186,12 +202,7 @@ async def post_event(request):
         event_upper = event.upper()
         # DISCONNECTED also contains CONNECTED; exclude it from this branch.
         if "CONNECTED" in event_upper and "DISCONNECTED" not in event_upper:
-            # Проверяем предыдущий статус
-            prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?",
-                                (mac, data["router_id"])).fetchone()
-            was_online = prev["online"] if prev else 0
-            watch_online = prev["watch_online"] if prev else 1
-            record_device_arrival(conn, data["router_id"], chat_id, mac)
+            arrival = record_device_arrival(conn, data["router_id"], chat_id, mac)
 
             conn.execute(f"""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
@@ -202,30 +213,12 @@ async def post_event(request):
                     custom_name=COALESCE(excluded.custom_name, devices.custom_name)
             """, (mac, data["router_id"], data.get("ip"), data.get("hostname"), data.get("custom_name"), now, now))
 
-            # Уведомление о подключении, если был оффлайн (с дедупликацией)
-            if chat_id and was_online == 0 and watch_online == 1:
-                if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
-                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
-                    label = "🆕 Новое устройство" if prev is None else "🟢 Устройство онлайн"
-                    device_name = notification_device_name(conn, chat_id, mac, data["router_id"])
-                    notifications.append((chat_id, f"{label}: `{mac}` — {device_name}"))
+            if arrival:
+                queue_presence_notification(conn, notifications, chat_id, mac, data["router_id"], arrival)
 
         elif "DISCONNECTED" in event_upper:
-            # Проверяем предыдущий статус
-            prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?",
-                                (mac, data["router_id"])).fetchone()
-            was_online = prev["online"] if prev else 0
-            watch_online = prev["watch_online"] if prev else 1
-
             conn.execute("UPDATE devices SET online=0, last_seen=? WHERE mac=? AND router_id=? AND online=1",
                          (now, mac, data["router_id"]))
-
-            # Уведомление об отключении, если был онлайн и watch_online включен (с дедупликацией)
-            if chat_id and was_online == 1 and watch_online == 1:
-                if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=0):
-                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=0)
-                    name = notification_device_name(conn, chat_id, mac, data["router_id"])
-                    notifications.append((chat_id, f"🔴 Устройство оффлайн: `{mac}` — {name}"))
 
     for chat_id, text in notifications:
         send_telegram_notification(chat_id, text)
@@ -258,9 +251,9 @@ async def post_devices(request):
                 continue
 
             # Check if device is new
-            prev = conn.execute("SELECT online, watch_online FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
+            prev = conn.execute("SELECT 1 FROM devices WHERE mac=? AND router_id=?", (mac, data["router_id"])).fetchone()
             is_new = prev is None
-            record_device_arrival(conn, data["router_id"], chat_id, mac)
+            arrival = record_device_arrival(conn, data["router_id"], chat_id, mac)
 
             conn.execute(f"""
                 INSERT INTO devices (mac, router_id, ip, hostname, custom_name, online, first_seen, last_seen)
@@ -275,16 +268,9 @@ async def post_devices(request):
             saved += 1
 
             if is_new and chat_id:
-                if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
-                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
-                    device_name = notification_device_name(conn, chat_id, mac, data["router_id"])
-                    notifications.append((chat_id, f"🆕 Новое устройство: `{mac}` — {device_name}"))
                 new_devices.append(mac)
-            elif chat_id and prev["online"] == 0 and prev["watch_online"] == 1:
-                if can_notify_device(chat_id, mac, data["router_id"], conn=conn, notification_state=1):
-                    mark_device_notified(chat_id, mac, data["router_id"], conn=conn, notification_state=1)
-                    device_name = notification_device_name(conn, chat_id, mac, data["router_id"])
-                    notifications.append((chat_id, f"🟢 Устройство онлайн: `{mac}` — {device_name}"))
+            if arrival:
+                queue_presence_notification(conn, notifications, chat_id, mac, data["router_id"], arrival)
 
     for chat_id, text in notifications:
         send_telegram_notification(chat_id, text)
@@ -450,30 +436,8 @@ async def check_offline_devices(app):
                         name = router["name"] or router["router_id"]
                         notifications.append((router["chat_id"], f"🔴 Роутер оффлайн: {name}"))
 
-                # Update status for every stale device; watch_online controls messages only.
-                stale_devices = conn.execute("""
-                    SELECT d.mac, d.router_id, d.watch_online, r.chat_id
-                    FROM devices d
-                    JOIN routers r ON d.router_id = r.router_id
-                    WHERE d.online=1 AND d.last_seen < ?
-                """, (threshold,)).fetchall()
-
-                for dev in stale_devices:
-                    mac = dev["mac"]
-                    router_id = dev["router_id"]
-                    chat_id = dev["chat_id"]
-
-                    # Mark as offline
-                    conn.execute("UPDATE devices SET online=0 WHERE mac=? AND router_id=?", (mac, router_id))
-
-                    # Send notification if not recently notified
-                    if (chat_id and dev["watch_online"] == 1
-                            and can_notify_device(chat_id, mac, router_id, conn=conn, notification_state=0)):
-                        mark_device_notified(chat_id, mac, router_id, conn=conn, notification_state=0)
-                        device_name = notification_device_name(conn, chat_id, mac, router_id)
-                        notifications.append((chat_id, f"🔴 Устройство оффлайн (таймаут): `{mac}` — {device_name}"))
-
-                record_history_timeouts(conn, now, threshold)
+                conn.execute("UPDATE devices SET online=0 WHERE online=1 AND last_seen < ?", (threshold,))
+                record_history_timeouts(conn, notifications, now, threshold)
 
             for chat_id, text in notifications:
                 send_telegram_notification(chat_id, text)

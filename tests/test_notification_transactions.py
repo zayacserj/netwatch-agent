@@ -113,6 +113,7 @@ class Transactions(unittest.TestCase):
             conn.execute("""INSERT INTO devices
                 (mac,router_id,online,watch_online,custom_name,hostname)
                 VALUES (?,'r',?,?, 'My device','host')""", (mac, online, watch))
+            conn.execute("INSERT INTO device_history_presence VALUES (1, ?, ?)", (mac, online))
 
     def online(self, mac='aa'):
         with closing(sqlite3.connect(self.path)) as conn:
@@ -126,7 +127,11 @@ class Transactions(unittest.TestCase):
                 self.seed_device(mac)
                 self.run_handler('post_event', dict(router_id='r', mac=mac, event=event))
                 self.assertEqual(self.online(mac), 0)
-                self.assertEqual(self.sent[-1], (1, f'🔴 Устройство оффлайн: `{mac}` — My device'))
+                self.assertEqual(len(self.sent), index)
+                with db.db_session() as conn:
+                    conn.execute("UPDATE devices SET last_seen=0 WHERE mac=?", (mac,))
+                self.offline()
+                self.assertEqual(self.sent[-1], (1, f'🔴 Устройство оффлайн (таймаут): `{mac}` — My device'))
                 self.assertEqual(len(self.sent), index + 1)
                 self.run_handler('post_event', dict(router_id='r', mac=mac, event=event))
                 self.assertEqual(len(self.sent), index + 1)
@@ -270,6 +275,7 @@ class Transactions(unittest.TestCase):
         snapshot('r')
         self.offline()
         self.assertEqual([row['event'] for row in db.get_user_events(1)], ['device_new'])
+        self.assertEqual(len(self.sent), 1)
 
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
@@ -279,6 +285,9 @@ class Transactions(unittest.TestCase):
         snapshot('second')
         self.assertEqual([row['event'] for row in db.get_user_events(1)], [
             'device_online', 'device_offline', 'device_new',
+        ])
+        self.assertEqual([message.split(':', 1)[0] for _, message in self.sent], [
+            '🆕 Новое устройство', '🔴 Устройство оффлайн (таймаут)', '🟢 Устройство онлайн',
         ])
 
     def test_presence_migration_uses_existing_online_status_without_history(self):
@@ -572,13 +581,16 @@ class Transactions(unittest.TestCase):
             {'mac': 'aa', 'hostname': 'unknown'}, {'mac': 'bb', 'hostname': '*'},
         ]))
         self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
+        with db.db_session() as conn:
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+        self.offline()
         self.run_handler('post_devices', dict(router_id='r', devices=[
             {'mac': 'aa', 'hostname': 'unknown'},
         ]))
         self.assertEqual(self.sent, [
-            (1, '🆕 Новое устройство: `aa` — iPhone15pro'),
+            (1, '🟢 Устройство онлайн: `aa` — iPhone15pro'),
             (1, '🆕 Новое устройство: `bb` — bb'),
-            (1, '🔴 Устройство оффлайн: `aa` — iPhone15pro'),
+            (1, '🔴 Устройство оффлайн (таймаут): `aa` — iPhone15pro'),
             (1, '🟢 Устройство онлайн: `aa` — iPhone15pro'),
         ])
 
@@ -603,10 +615,14 @@ class Transactions(unittest.TestCase):
 
     def test_opposite_transitions_are_not_suppressed_by_recent_notification(self):
         self.seed_device()
-        self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
-        self.run_handler('post_devices', dict(router_id='r', devices=[{'mac': 'aa'}]))
-        self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
-        self.run_handler('post_event', dict(router_id='r', mac='aa', event='CONNECTED'))
+        for handler in ('post_devices', 'post_event'):
+            self.run_handler('post_event', dict(router_id='r', mac='aa', event='DISCONNECTED'))
+            with db.db_session() as conn:
+                conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
+            self.offline()
+            data = (dict(router_id='r', devices=[{'mac': 'aa'}]) if handler == 'post_devices'
+                    else dict(router_id='r', mac='aa', event='CONNECTED'))
+            self.run_handler(handler, data)
         self.assertEqual(len(self.sent), 4)
         self.assertTrue(self.sent[0][1].startswith('🔴'))
         self.assertTrue(self.sent[1][1].startswith('🟢'))
@@ -693,8 +709,9 @@ class Transactions(unittest.TestCase):
                 asyncio.run(api.check_offline_devices(None))
 
     def test_offline_commits_before_send(self):
+        self.seed_device()
         with db.db_session() as conn:
-            conn.execute("INSERT INTO devices(mac,router_id,online,last_seen) VALUES ('aa','r',1,0)")
+            conn.execute("UPDATE devices SET last_seen=0 WHERE mac='aa'")
         self.offline()
         self.assertEqual(len(self.sent), 1)
 

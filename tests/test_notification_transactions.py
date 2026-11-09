@@ -722,15 +722,21 @@ class Transactions(unittest.TestCase):
         self.seed_device()
         with db.db_session() as conn:
             conn.execute("UPDATE devices SET last_seen=1000 WHERE mac='aa'")
-        with patch.object(api, 'DEVICE_OFFLINE_AFTER', 55), patch.object(api.time, 'time') as clock:
+            conn.execute("INSERT INTO users(chat_id) VALUES (2)")
+            conn.execute("INSERT INTO routers(router_id,chat_id,online) VALUES ('legacy',2,1)")
+            conn.execute("INSERT INTO devices(mac,router_id,online,last_seen) VALUES ('aa','legacy',1,1000)")
+            conn.execute("INSERT INTO device_history_presence VALUES (2, 'aa', 1)")
+        with patch.object(api, 'FAST_DEVICE_CHAT_IDS', (1,)), patch.object(api.time, 'time') as clock:
             clock.return_value = 1020
             self.run_handler('post_devices', dict(router_id='r', devices=[]))
+            self.run_handler('post_devices', dict(router_id='legacy', devices=[]))
             clock.return_value = 1055
             self.offline()
-            self.assertEqual(self.online(), 1)
+            self.assertEqual(db.get_device(1, 'aa', 'r')['online'], 1)
             clock.return_value = 1060
             self.offline()
-            self.assertEqual(self.online(), 0)
+            self.assertEqual(db.get_device(1, 'aa', 'r')['online'], 0)
+            self.assertEqual(db.get_device(2, 'aa', 'legacy')['online'], 1)
         self.assertEqual(len(self.sent), 1)
 
     def test_notification_migration_preserves_legacy_data_and_is_repeatable(self):

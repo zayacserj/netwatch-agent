@@ -37,7 +37,12 @@ DB_PATH = Path("/opt/netwatch/netwatch.db")
 AGENT_SECRET = os.getenv("AGENT_SECRET", "changeme")
 AGENT_SCRIPT_PATH = Path("/opt/netwatch/agent3.sh")
 ROUTER_OFFLINE_AFTER = 7 * 60
-DEVICE_OFFLINE_AFTER = 55 if os.getenv("NETWATCH_FAST_DEVICE_SNAPSHOTS") == "1" else 120
+DEVICE_OFFLINE_AFTER = 120
+FAST_DEVICE_OFFLINE_AFTER = 55
+FAST_DEVICE_CHAT_IDS = tuple(
+    int(value) for value in os.getenv("NETWATCH_FAST_DEVICE_CHAT_IDS", "").split(",")
+    if value.strip()
+)
 OFFLINE_CHECK_INTERVAL = 10
 KEEP_KNOWN_HOSTNAME = """
     CASE WHEN lower(trim(excluded.hostname)) NOT IN ('', '*', 'unknown')
@@ -158,9 +163,20 @@ def record_device_arrival(conn, router_id, chat_id, mac):
     return event
 
 
-def record_history_timeouts(conn, notifications, now, threshold):
+def device_offline_cutoff(owner, now):
+    if not FAST_DEVICE_CHAT_IDS:
+        return "?", (now - DEVICE_OFFLINE_AFTER,)
+    placeholders = ", ".join("?" for _ in FAST_DEVICE_CHAT_IDS)
+    return (
+        f"CASE WHEN {owner}.chat_id IN ({placeholders}) THEN ? ELSE ? END",
+        (*FAST_DEVICE_CHAT_IDS, now - FAST_DEVICE_OFFLINE_AFTER, now - DEVICE_OFFLINE_AFTER),
+    )
+
+
+def record_history_timeouts(conn, notifications, now):
     # Let a new access point report the device before confirming a departure.
-    rows = conn.execute("""
+    cutoff, params = device_offline_cutoff("p", now)
+    rows = conn.execute(f"""
         SELECT p.chat_id, p.mac, (
             SELECT d.router_id FROM devices d JOIN routers r ON r.router_id=d.router_id
             WHERE r.chat_id=p.chat_id AND d.mac=p.mac COLLATE NOCASE
@@ -170,9 +186,9 @@ def record_history_timeouts(conn, notifications, now, threshold):
         WHERE p.online=1 AND NOT EXISTS (
             SELECT 1 FROM devices d JOIN routers r ON r.router_id=d.router_id
             WHERE r.chat_id=p.chat_id AND d.mac=p.mac COLLATE NOCASE
-              AND (d.online=1 OR d.last_seen>=?)
+              AND (d.online=1 OR d.last_seen >= {cutoff})
         )
-    """, (threshold,)).fetchall()
+    """, params).fetchall()
     for row in rows:
         conn.execute("""
             UPDATE device_history_presence SET online=0 WHERE chat_id=? AND mac=?
@@ -448,7 +464,6 @@ async def check_offline_devices(app):
             with db_session() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 now = int(time.time())
-                threshold = now - DEVICE_OFFLINE_AFTER
                 stale_routers = conn.execute("""
                     UPDATE routers SET online=0
                     WHERE online=1 AND last_seen < ?
@@ -463,16 +478,18 @@ async def check_offline_devices(app):
                         name = router["name"] or router["router_id"]
                         notifications.append((router["chat_id"], f"🔴 Роутер оффлайн: {name}"))
 
-                conn.execute("""
+                cutoff, params = device_offline_cutoff("r", now)
+                conn.execute(f"""
                     UPDATE devices SET online=0
-                    WHERE online=1 AND last_seen < ? AND EXISTS (
+                    WHERE online=1 AND EXISTS (
                         SELECT 1 FROM routers r
                         WHERE r.router_id=devices.router_id
+                          AND devices.last_seen < {cutoff}
                           AND r.device_snapshot_at > devices.last_seen
                           AND r.device_snapshot_at >= ?
                     )
-                """, (threshold, now - 75))
-                record_history_timeouts(conn, notifications, now, threshold)
+                """, (*params, now - 75))
+                record_history_timeouts(conn, notifications, now)
 
             for chat_id, text in notifications:
                 send_telegram_notification(chat_id, text)

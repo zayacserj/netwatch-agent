@@ -98,8 +98,8 @@ def _agent_install_command(code, url):
     from shlex import quote
     from urllib.parse import urlsplit
 
-    release_ref = "82221b18ae1b8c17c2ab4d18549d46a6381f76d3"
-    agent_sha256 = "2b5763f77db64abcd4f788045d1a8f66b0283868ad75a8426abc2f2b33b5ae04"
+    release_ref = "b236f90799ead2eab13bb655ca78bda0cc295f58"
+    agent_sha256 = "5d474ac1451f14aac9c06c12d1c43789136c41ab51d4aea4a600d5fb652474f3"
     if (not isinstance(code, str) or len(code) != 8
             or any(c not in "0123456789abcdefABCDEF" for c in code)):
         raise ValueError("Invalid pairing code")

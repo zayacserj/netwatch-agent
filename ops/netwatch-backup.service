@@ -5,6 +5,7 @@ Description=Create and verify NetWatch backups
 Type=oneshot
 User=root
 UMask=0077
+Environment=NETWATCH_BACKUP_KEEP_DAYS=30
 EnvironmentFile=-/etc/netwatch-backup.conf
 ExecStart=/usr/bin/python3 -IB /usr/local/lib/netwatch/backup_netwatch.py create
 Nice=10

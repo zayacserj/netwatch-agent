@@ -56,6 +56,63 @@ def disk(path):
     }
 
 
+def usb_block_devices():
+    devices = {}
+    for entry in Path("/sys/class/block").glob("*"):
+        try:
+            node = entry.resolve(strict=True)
+            if not any((parent / "subsystem").resolve() == Path("/sys/bus/usb")
+                       for parent in node.parents):
+                continue
+            drive = node.parent.name if (node / "partition").exists() else node.name
+            devices[node.name] = (drive, (node / "dev").read_text().strip())
+        except OSError:
+            continue
+    return devices
+
+
+def storage(mounts):
+    result = [disk(path) for path in mounts]
+    devices = usb_block_devices()
+    if not devices:
+        return result
+    drives = {drive for drive, _ in devices.values()}
+    by_number = {number: name for name, (_, number) in devices.items()}
+    seen = set()
+    try:
+        lines = Path("/proc/self/mountinfo").read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        left, _, right = line.partition(" - ")
+        fields, filesystem = left.split(), right.split()
+        if len(fields) < 6 or len(filesystem) < 2 or fields[3] != "/":
+            continue
+        name = by_number.get(fields[2])
+        if name is None and filesystem[1].startswith("/dev/"):
+            name = Path(filesystem[1]).resolve().name
+        if name not in devices or name in seen:
+            continue
+        path = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4])
+        try:
+            device = os.stat(path).st_dev
+            if fields[2] != f"{os.major(device)}:{os.minor(device)}":
+                continue
+            row = disk(path)
+            if os.stat(path).st_dev != device:
+                continue
+        except OSError:
+            continue
+        seen.add(name)
+        drives.discard(devices[name][0])
+        if path not in mounts:
+            result.append({**row, "label": f"USB · {name} · {path}"})
+    for drive in sorted(drives):
+        result.append({"mount": None, "available": False, "label": f"USB · {drive}",
+                       "mounted": False})
+    return result
+
+
 def cpu_temperature():
     for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
         try:
@@ -166,7 +223,7 @@ class Collector:
                     "temperature_c": cpu_temperature(),
                     "uptime_seconds": int(float(Path("/proc/uptime").read_text().split()[0])),
                     "memory": memory(),
-                    "storage": [disk(path) for path in self.mounts],
+                    "storage": storage(self.mounts),
                     "network": network_rates(previous_network, network, now - previous_time),
                     **slow,
                 }

@@ -1,4 +1,5 @@
 from contextlib import closing
+from datetime import datetime, timezone
 import importlib.util
 import os
 from pathlib import Path
@@ -74,6 +75,17 @@ class Backup(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), [
             "before-manual-maintenance.tar.gz", "netwatch-20261108T032000000000Z-bbbbbbbb.tar.gz",
         ])
+
+    def test_age_rotation_uses_archive_timestamp_and_keeps_cutoff(self):
+        old = self.root / "netwatch-20261007T020000000000Z-aaaaaaaa.tar.gz"
+        boundary = self.root / "netwatch-20261008T020000000000Z-bbbbbbbb.tar.gz"
+        manual = self.root / "before-maintenance.tar.gz"
+        for path in (old, boundary, manual):
+            path.touch()
+        backup.prune(self.root, keep=0, cutoff=datetime(2026, 10, 8, 2, tzinfo=timezone.utc))
+        self.assertFalse(old.exists())
+        self.assertTrue(boundary.exists())
+        self.assertTrue(manual.exists())
 
     def test_prepare_restore_checks_runtime_and_uses_private_staging(self):
         database = self.root / "live.db"

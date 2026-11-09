@@ -2,7 +2,8 @@
 Description=Daily NetWatch backup
 
 [Timer]
-OnCalendar=*-*-* 03:20:00
+OnCalendar=*-*-* 02:00:00
+AccuracySec=1s
 Persistent=true
 
 [Install]

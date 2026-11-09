@@ -59,9 +59,9 @@ function render(snapshot) {
   byId("temperature").textContent = Number.isFinite(snapshot.temperature_c)
     ? `${decimal.format(snapshot.temperature_c)} °C` : "—";
   byId("uptime").textContent = uptime(snapshot.uptime_seconds);
-  rows("storage", snapshot.storage.map((disk) => [disk.mount, disk.available
+  rows("storage", snapshot.storage.map((disk) => [disk.label ?? disk.mount, disk.available
     ? `Занято ${bytes(disk.used_bytes)} · свободно ${bytes(disk.available_bytes)} из ${bytes(disk.total_bytes)}`
-    : "Недоступен"]), "Накопители не обнаружены");
+    : disk.mounted === false ? "Не смонтирован" : "Недоступен"]), "Накопители не обнаружены");
   const speed = (value) => Number.isFinite(value) ? `${bytes(value)}/с` : "—";
   rows("network", snapshot.network.map((nic) => [nic.interface,
     `↓ ${speed(nic.rx_bytes_per_s)} · ↑ ${speed(nic.tx_bytes_per_s)}`]), "Интерфейсы не обнаружены");

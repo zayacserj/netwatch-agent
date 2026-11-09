@@ -1,7 +1,7 @@
 """Create and verify NetWatch backups without stopping the running services."""
 import argparse
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from importlib import metadata
 import json
@@ -13,6 +13,7 @@ import secrets
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -256,7 +257,7 @@ def mount_uuid(mount):
     return output.stdout.strip().lower() if output.returncode == 0 else ""
 
 
-def copy_to_usb(archive, mount, uuid):
+def copy_to_usb(archive, mount, uuid, *, cutoff=None):
     if mount_uuid(mount) != uuid.lower():
         return False
     fd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -282,6 +283,13 @@ def copy_to_usb(archive, mount, uuid):
                         raise RuntimeError("USB archive SHA-256 mismatch")
                 os.replace(temporary, archive.name, src_dir_fd=target, dst_dir_fd=target)
                 os.fsync(target)
+                if cutoff is not None:
+                    for name in os.listdir(target):
+                        if expired_archive(name, cutoff) and stat.S_ISREG(
+                            os.stat(name, dir_fd=target, follow_symlinks=False).st_mode
+                        ):
+                            os.unlink(name, dir_fd=target)
+                    os.fsync(target)
             finally:
                 try:
                     os.unlink(temporary, dir_fd=target)
@@ -294,13 +302,27 @@ def copy_to_usb(archive, mount, uuid):
     return True
 
 
-def prune(destination, keep):
-    if keep < 1:
+def expired_archive(name, cutoff):
+    if not ARCHIVE_NAME.fullmatch(name):
+        return False
+    timestamp = name.removeprefix("netwatch-").split("-", 1)[0]
+    try:
+        created = datetime.strptime(timestamp, "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return created < cutoff
+
+
+def prune(destination, keep, *, cutoff=None):
+    if keep < 1 and cutoff is None:
         return
     archives = sorted(path for path in destination.iterdir()
                       if ARCHIVE_NAME.fullmatch(path.name) and path.is_file() and not path.is_symlink())
-    for path in archives[:-keep]:
-        path.unlink()
+    for index, path in enumerate(archives):
+        if (keep > 0 and index < len(archives) - keep) or (
+            cutoff is not None and expired_archive(path.name, cutoff)
+        ):
+            path.unlink()
 
 
 def main():
@@ -325,17 +347,20 @@ def main():
               + ", ".join(f"{name}=={version}" for name, version in profile["packages"].items()))
         return 0
 
+    keep_days = int(os.getenv("NETWATCH_BACKUP_KEEP_DAYS", "0"))
+    keep = int(os.getenv("NETWATCH_BACKUP_KEEP", "0"))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days) if keep_days > 0 else None
     archive = create_archive(DESTINATION, live_files(), database_files(), runtime=runtime_profile())
     print(f"Локальный архив проверен: {archive}", flush=True)
     usb = [os.getenv(key, "") for key in ("NETWATCH_USB_MOUNT", "NETWATCH_USB_UUID")]
     if any(usb):
         if not all(usb) or not Path(usb[0]).is_absolute():
             raise RuntimeError("Incomplete USB backup configuration")
-        if not copy_to_usb(archive, Path(usb[0]), usb[1]):
+        if not copy_to_usb(archive, Path(usb[0]), usb[1], cutoff=cutoff):
             print("USB-копия пропущена: настроенный носитель не смонтирован.", file=sys.stderr)
             return 2
         print(f"Копия на USB проверена по SHA-256: {archive.name}")
-    prune(DESTINATION, int(os.getenv("NETWATCH_BACKUP_KEEP", "0")))
+    prune(DESTINATION, keep, cutoff=cutoff)
     return 0
 
 

@@ -13,6 +13,7 @@ import sqlite3
 import secrets
 import re
 import asyncio
+from html import escape
 from pathlib import Path
 
 # Загрузка переменных окружения из .env (если есть)
@@ -56,7 +57,7 @@ def queue_presence_notification(conn, notifications, chat_id, mac, router_id, ev
     notifications.append((chat_id, f"{labels[event]}: `{mac}` — {name}"))
 
 # --- Telegram notification helper ---
-def send_telegram_notification(chat_id, text):
+def send_telegram_notification(chat_id, text, *, parse_mode=None):
     """Отправляет уведомление в Telegram"""
     import urllib.request
     import os as _os
@@ -68,7 +69,10 @@ def send_telegram_notification(chat_id, text):
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = json.dumps({"chat_id": chat_id, "text": text}).encode()
+        message = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            message["parse_mode"] = parse_mode
+        data = json.dumps(message).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=5):
             pass
@@ -107,6 +111,7 @@ async def auth_middleware(request, handler):
 def record_router_report(conn, router_id, notifications):
     router = conn.execute("""
         SELECT r.name, r.chat_id, r.online, r.podkop_proxy_tag, r.podkop_proxy_sample_at,
+               r.podkop_proxy_latency_ms,
                s.watch_podkop_proxy, s.watch_router_online
         FROM routers r LEFT JOIN user_settings s ON s.chat_id=r.chat_id
         WHERE r.router_id=?
@@ -278,6 +283,11 @@ async def post_devices(request):
     return web.json_response({"status": "ok", "saved_devices": saved, "new_devices": new_devices})
 
 # --- POST /health ---
+def format_proxy(tag, latency):
+    delay = f"<b>({latency} мс)</b>" if latency is not None else "(нет замера)"
+    return f"<code>{escape(tag)}</code> {delay}"
+
+
 async def post_health(request):
     try:
         data = await request.json()
@@ -293,6 +303,7 @@ async def post_health(request):
         return web.json_response({"error": "Invalid proxy latency"}, status=400)
 
     notifications = []
+    proxy_alert = None
     with db_session() as conn:
         timestamp = data.get("timestamp", int(time.time()))
         conn.execute("""
@@ -314,15 +325,25 @@ async def post_health(request):
                 and type(timestamp) is int and timestamp > 0
                 and (router["podkop_proxy_sample_at"] is None or timestamp > router["podkop_proxy_sample_at"])):
             previous = router["podkop_proxy_tag"]
+            previous_latency = router["podkop_proxy_latency_ms"]
+            stored_latency = previous_latency if previous == proxy_tag and latency is None else latency
             conn.execute("""
-                UPDATE routers SET podkop_proxy_tag=?, podkop_proxy_sample_at=? WHERE router_id=?
-            """, (proxy_tag, timestamp, router_id))
+                UPDATE routers SET podkop_proxy_tag=?, podkop_proxy_sample_at=?,
+                                   podkop_proxy_latency_ms=?
+                WHERE router_id=?
+            """, (proxy_tag, timestamp, stored_latency, router_id))
             if previous and previous != proxy_tag and router["watch_podkop_proxy"]:
                 name = router["name"] or router_id
-                notifications.append((router["chat_id"], f"🔀 Podkop сменил прокси на {name}\n{previous} → {proxy_tag}"))
+                proxy_alert = (
+                    router["chat_id"],
+                    f"🔀 Podkop сменил прокси на {escape(name)}\n"
+                    f"🔴 {format_proxy(previous, previous_latency)} → 🟢 {format_proxy(proxy_tag, latency)}",
+                )
 
     for chat_id, text in notifications:
         send_telegram_notification(chat_id, text)
+    if proxy_alert:
+        send_telegram_notification(*proxy_alert, parse_mode="HTML")
 
     return web.json_response({"status": "ok", "saved": True})
 

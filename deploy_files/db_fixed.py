@@ -63,6 +63,7 @@ def init_db():
             last_seen INTEGER DEFAULT (unixepoch()),
             podkop_proxy_tag TEXT,
             podkop_proxy_sample_at INTEGER,
+            podkop_proxy_latency_ms INTEGER,
             created_at INTEGER DEFAULT (unixepoch()),
             FOREIGN KEY (chat_id) REFERENCES users(chat_id)
         );
@@ -165,6 +166,8 @@ def init_db():
             conn.execute("ALTER TABLE routers ADD COLUMN podkop_proxy_tag TEXT")
         if "podkop_proxy_sample_at" not in router_columns:
             conn.execute("ALTER TABLE routers ADD COLUMN podkop_proxy_sample_at INTEGER")
+        if "podkop_proxy_latency_ms" not in router_columns:
+            conn.execute("ALTER TABLE routers ADD COLUMN podkop_proxy_latency_ms INTEGER")
         health_columns = [col["name"] for col in conn.execute("PRAGMA table_info(health_checks)").fetchall()]
         if "podkop_latency_ms" not in health_columns:
             conn.execute("ALTER TABLE health_checks ADD COLUMN podkop_latency_ms INTEGER")

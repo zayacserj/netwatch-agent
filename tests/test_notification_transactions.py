@@ -324,6 +324,7 @@ class Transactions(unittest.TestCase):
             conn.execute("ALTER TABLE user_settings DROP COLUMN watch_router_online")
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_tag")
             conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_sample_at")
+            conn.execute("ALTER TABLE routers DROP COLUMN podkop_proxy_latency_ms")
             conn.execute("INSERT INTO user_settings(chat_id, watch_online) VALUES (1, 0)")
         db.init_db()
         db.init_db()
@@ -333,23 +334,33 @@ class Transactions(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT watch_online FROM devices WHERE router_id='r'").fetchone()[0], 0)
 
     def test_proxy_alert_uses_last_valid_tag_and_respects_setting(self):
-        def report(tag, timestamp, status='running'):
+        def report(tag, timestamp, status='running', latency=None):
             self.run_handler('post_health', dict(router_id='r', internet=True, wifi=True,
                              cpu='1%', ram='2', wifi_clients=1, podkop_status=status,
-                             podkop_test=None, podkop_proxy_tag=tag, timestamp=timestamp))
+                             podkop_test=None, podkop_proxy_tag=tag, timestamp=timestamp,
+                             podkop_latency_ms=latency))
 
         with patch.object(api, 'send_telegram_notification') as send:
             report('server-a', 100)
-            report('server-b', 110)
+            report('server-b', 110, latency=222)
             send.assert_not_called()
             self.assertTrue(db.toggle_notification_setting(1, 'podkop'))
             report(None, 120, 'unknown')
-            report('older', 105)
+            report('older', 105, latency=999)
             report('server-b', 130)
             send.assert_not_called()
-            report('server-c', 140)
-            report('server-c', 150)
-            send.assert_called_once_with(1, '🔀 Podkop сменил прокси на r\nserver-b → server-c')
+            report('server<c>', 140, latency=140)
+            report('server<c>', 150)
+            send.assert_called_once_with(
+                1, '🔀 Podkop сменил прокси на r\n🔴 <code>server-b</code> <b>(222 мс)</b> → '
+                   '🟢 <code>server&lt;c&gt;</code> <b>(140 мс)</b>', parse_mode='HTML',
+            )
+            send.reset_mock()
+            report('server-d', 160)
+            send.assert_called_once_with(
+                1, '🔀 Podkop сменил прокси на r\n🔴 <code>server&lt;c&gt;</code> <b>(140 мс)</b> → '
+                   '🟢 <code>server-d</code> (нет замера)', parse_mode='HTML',
+            )
 
     def test_router_offline_and_recovery_alert_each_sent_once(self):
         self.assertEqual(db.get_notification_settings(1), {'podkop': False, 'router': False})

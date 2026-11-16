@@ -12,7 +12,7 @@ import time
 
 ASSETS = Path(__file__).parent
 CORE_SERVICES = ("caddy.service", "netwatch-api.service", "netwatch-bot.service")
-SAMPLE_SECONDS = 5
+SAMPLE_SECONDS = 2
 SERVICE_SECONDS = 30
 
 

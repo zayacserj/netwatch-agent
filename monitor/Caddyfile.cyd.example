@@ -1,0 +1,11 @@
+# Replace PI_LAN_IP with the Raspberry Pi's private IPv4 address.
+# Do not forward port 8091 on the WAN router.
+http://PI_LAN_IP:8091 {
+    bind PI_LAN_IP
+    handle /monitor/api/v1/metrics {
+        reverse_proxy 127.0.0.1:8090
+    }
+    handle {
+        respond 404
+    }
+}
